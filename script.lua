@@ -143,27 +143,14 @@ end
 
 local function isInSameArena(myChar, myHrp, targetChar, targetHrp)
 	if not myHrp or not targetHrp then return false end
-	if math.abs(targetHrp.Position.Y - myHrp.Position.Y) > 16 then return false end
+	if math.abs(targetHrp.Position.Y - myHrp.Position.Y) > 18 then return false end
 	local myFloor = getFloorPart(myChar, myHrp)
 	local targetFloor = getFloorPart(targetChar, targetHrp)
 	if not myFloor or not targetFloor then return false end
 	if myFloor ~= targetFloor then
 		local sameParent = myFloor.Parent and (myFloor.Parent == targetFloor.Parent)
-		local closeEnough = (myFloor.Position - targetFloor.Position).Magnitude < 18
+		local closeEnough = (myFloor.Position - targetFloor.Position).Magnitude < 20
 		if not (sameParent and closeEnough) then return false end
-	end
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = {myChar, targetChar}
-	local delta = targetHrp.Position - myHrp.Position
-	local dist = Vector3.new(delta.X, 0, delta.Z).Magnitude
-	if dist < 1 then return true end
-	local steps = math.clamp(math.floor(dist / 6), 1, 8)
-	for i = 1, steps do
-		local samplePos = myHrp.Position + delta * (i / (steps + 1)) + Vector3.new(0, 2, 0)
-		if not workspace:Raycast(samplePos, Vector3.new(0, -18, 0), params) then
-			return false
-		end
 	end
 	return true
 end
@@ -240,10 +227,13 @@ local function restoreCustomLocalStyle(char)
 end
 
 -- =========================================================
--- 3) الذكاء الاصطناعي والمراوغة وتقدير المخاطر والزوايا
+-- 3) الذكاء الاصطناعي: مراوغات أرضية + مراوغات قفز + صعود/نزول
 -- =========================================================
 local rowRefs = {}
+local uiStatusUpdater = nil
+local currentModeTag = "IDLE"
 local jukePhase = "none"
+local jukeIsJumpMode = false
 local jukeTimer = 0
 local jukeSign = 1
 local arcPhaseClock = 0
@@ -261,12 +251,43 @@ local pathComputeTimer = 0
 local cachedWaypoints = {}
 local waypointIndex = 2
 
+local GROUND_JUKE_PATTERNS = {
+	"ground_bait_drift",
+	"ground_snap_cut",
+	"ground_crescent_arc",
+	"ground_zig_pulse",
+	"ground_hook_feint",
+	"ground_flank_dash",
+	"ground_pivot_backstep",
+	"ground_serpentine_weave",
+	"ground_stop_and_slip",
+	"ground_wide_sweep"
+}
+
+local JUMP_JUKE_PATTERNS = {
+	"jump_snap_cross",
+	"jump_flank_vault",
+	"jump_crescent_hop",
+	"jump_feint_hop",
+	"jump_back_angle",
+	"jump_zig_hop",
+	"jump_gap_slip",
+	"jump_over_pressure"
+}
+
+local function setModeTag(tag)
+	currentModeTag = tag
+	if uiStatusUpdater then
+		pcall(uiStatusUpdater, tag)
+	end
+end
+
 local function smoothHumanDir(fromDir, toDir, dt, turnSpeed)
 	if not toDir or toDir.Magnitude < 0.05 then return fromDir end
 	local targetUnit = Vector3.new(toDir.X, 0, toDir.Z).Unit
 	if not fromDir or fromDir.Magnitude < 0.05 then return targetUnit end
 	local fromUnit = Vector3.new(fromDir.X, 0, fromDir.Z).Unit
-	local alpha = math.clamp(dt * (turnSpeed or currentTurnRate or 12.0), 0.12, 0.72)
+	local alpha = math.clamp(dt * (turnSpeed or currentTurnRate or 12.0), 0.12, 0.75)
 	local blended = fromUnit:Lerp(targetUnit, alpha)
 	return blended.Magnitude < 0.01 and targetUnit or blended.Unit
 end
@@ -318,17 +339,18 @@ local function probeObstacle(myChar, myHrp, dir, dist)
 	end
 end
 
-local function triggerJumpSkill(myHum, cooldownSec, dirToSnap)
-	if not myHum or jumpCooldown > 0 or myHum.FloorMaterial == Enum.Material.Air then return false end
+local function triggerJumpSkill(myHum, cooldownSec, dirToSnap, allowInAir)
+	if not myHum or jumpCooldown > 0 then return false end
+	if not allowInAir and myHum.FloorMaterial == Enum.Material.Air then return false end
 	if dirToSnap and dirToSnap.Magnitude > 0.05 then
 		currentMoveDir = Vector3.new(dirToSnap.X, 0, dirToSnap.Z).Unit
 	end
 	myHum.Jump = true
-	jumpCooldown = cooldownSec or (0.50 + math.random(5, 18) / 100)
+	jumpCooldown = cooldownSec or (0.46 + math.random(5, 16) / 100)
 	return true
 end
 
-local function isSafeDirection(myChar, myHrp, myHum, dir)
+local function isSafeDirection(myChar, myHrp, myHum, dir, allowEdgeJump)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = {myChar}
@@ -338,31 +360,33 @@ local function isSafeDirection(myChar, myHrp, myHum, dir)
 	for _, stepDist in ipairs({5, 9.5}) do
 		local floorHit = workspace:Raycast(myHrp.Position + dir * stepDist + Vector3.new(0, 2, 0), Vector3.new(0, -18, 0), params)
 		if not floorHit then
-			local farFloor = workspace:Raycast(myHrp.Position + dir * (stepDist + 4.5) + Vector3.new(0, 3, 0), Vector3.new(0, -20, 0), params)
-			if farFloor and myHum then
-				triggerJumpSkill(myHum, 0.52, dir)
-				return true
+			if allowEdgeJump ~= false then
+				local farFloor = workspace:Raycast(myHrp.Position + dir * (stepDist + 4.5) + Vector3.new(0, 3, 0), Vector3.new(0, -20, 0), params)
+				if farFloor and myHum then
+					triggerJumpSkill(myHum, 0.50, dir)
+					return true
+				end
 			end
 			return false
 		end
 		if myFloor and floorHit.Instance ~= myFloor and floorHit.Instance.Parent ~= myFloor.Parent then
-			if math.abs(floorHit.Position.Y - myHrp.Position.Y) > 9 then return false end
+			if math.abs(floorHit.Position.Y - myHrp.Position.Y) > 9.5 then return false end
 		end
 	end
 	return true
 end
 
-local function sanitizeDirection(myChar, myHrp, myHum, desiredDir)
-	if isSafeDirection(myChar, myHrp, myHum, desiredDir) then
+local function sanitizeDirection(myChar, myHrp, myHum, desiredDir, allowEdgeJump)
+	if isSafeDirection(myChar, myHrp, myHum, desiredDir, allowEdgeJump) then
 		local st, d = probeObstacle(myChar, myHrp, desiredDir, 7.5)
-		if st == "jumpable" and d < 5.5 then triggerJumpSkill(myHum, 0.50, desiredDir) end
+		if st == "jumpable" and d < 5.5 then triggerJumpSkill(myHum, 0.48, desiredDir) end
 		return desiredDir
 	end
 	for _, deg in ipairs({25, -25, 50, -50, 75, -75, 105, -105, 135, -135, 180}) do
 		local candidate = rotateFlatVector(desiredDir, deg)
-		if isSafeDirection(myChar, myHrp, myHum, candidate) then
+		if isSafeDirection(myChar, myHrp, myHum, candidate, allowEdgeJump) then
 			local st, d = probeObstacle(myChar, myHrp, candidate, 7.5)
-			if st == "jumpable" and d < 5.5 then triggerJumpSkill(myHum, 0.50, candidate) end
+			if st == "jumpable" and d < 5.5 then triggerJumpSkill(myHum, 0.48, candidate) end
 			return candidate
 		end
 	end
@@ -375,9 +399,15 @@ local function measureOpenSpace(myChar, originPos, dir)
 	params.FilterDescendantsInstances = {myChar}
 	local leftHit = workspace:Raycast(originPos, rotateFlatVector(dir, 55) * 12, params)
 	local rightHit = workspace:Raycast(originPos, rotateFlatVector(dir, -55) * 12, params)
+	local backLeftHit = workspace:Raycast(originPos, rotateFlatVector(dir, 125) * 10, params)
+	local backRightHit = workspace:Raycast(originPos, rotateFlatVector(dir, -125) * 10, params)
+
 	local leftSpace = (leftHit and leftHit.Instance.CanCollide) and leftHit.Distance or 12
 	local rightSpace = (rightHit and rightHit.Instance.CanCollide) and rightHit.Distance or 12
-	return leftSpace + rightSpace
+	local backLeftSpace = (backLeftHit and backLeftHit.Instance.CanCollide) and backLeftHit.Distance or 10
+	local backRightSpace = (backRightHit and backRightHit.Instance.CanCollide) and backRightHit.Distance or 10
+
+	return leftSpace + rightSpace + (backLeftSpace + backRightSpace) * 0.5
 end
 
 local function getCornerTrapPenalty(myChar, checkPos, dir)
@@ -422,11 +452,11 @@ local function findAscentSpot(myChar, myHrp, targetHrp)
 	for angOffset = -90, 90, 30 do
 		local probeDir = rotateFlatVector(baseDir, angOffset)
 		for _, dist in ipairs({5, 9, 13}) do
-			local downHit = workspace:Raycast(myHrp.Position + probeDir * dist + Vector3.new(0, 9.5, 0), Vector3.new(0, -11, 0), params)
+			local downHit = workspace:Raycast(myHrp.Position + probeDir * dist + Vector3.new(0, 10.5, 0), Vector3.new(0, -12, 0), params)
 			if downHit and downHit.Instance and downHit.Instance.CanCollide then
 				local stepY = downHit.Position.Y - myHrp.Position.Y
-				if stepY > 2.2 and stepY <= 11.5 then
-					local score = (12 - math.abs(stepY - 5)) * 4 - dist * 1.5
+				if stepY > 2.0 and stepY <= 12.5 then
+					local score = (13 - math.abs(stepY - 5.5)) * 4 - dist * 1.4
 					if score > bestScore then
 						bestScore = score
 						bestSpot = downHit.Position + Vector3.new(0, 2, 0)
@@ -435,6 +465,36 @@ local function findAscentSpot(myChar, myHrp, targetHrp)
 			end
 		end
 	end
+	return bestSpot
+end
+
+local function findDescentSpot(myChar, myHrp, targetHrp)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar, targetHrp.Parent}
+	local flatToTarget = Vector3.new(targetHrp.Position.X - myHrp.Position.X, 0, targetHrp.Position.Z - myHrp.Position.Z)
+	local baseDir = (flatToTarget.Magnitude > 0.05) and flatToTarget.Unit or Vector3.new(1, 0, 0)
+	local bestSpot, bestScore = nil, -math.huge
+
+	for angOffset = -90, 90, 30 do
+		local probeDir = rotateFlatVector(baseDir, angOffset)
+		for _, dist in ipairs({4, 8, 12}) do
+			local checkOrigin = myHrp.Position + probeDir * dist + Vector3.new(0, 1.5, 0)
+			local downHit = workspace:Raycast(checkOrigin, Vector3.new(0, -24, 0), params)
+			if downHit and downHit.Instance and downHit.Instance.CanCollide then
+				local dropY = myHrp.Position.Y - downHit.Position.Y
+				local closenessToTargetY = math.abs(downHit.Position.Y - targetHrp.Position.Y)
+				if dropY > 2.0 and dropY <= 20 and closenessToTargetY < 8 then
+					local score = (10 - closenessToTargetY) * 5 - dist * 1.2
+					if score > bestScore then
+						bestScore = score
+						bestSpot = downHit.Position + Vector3.new(0, 2, 0)
+					end
+				end
+			end
+		end
+	end
+
 	return bestSpot
 end
 
@@ -548,7 +608,7 @@ local function evaluateDirectionScore(myChar, myHrp, dir, threats)
 	if not floorHit then
 		score -= 140
 	elseif myFloor and floorHit.Instance ~= myFloor and floorHit.Instance.Parent ~= myFloor.Parent then
-		score += (math.abs(floorHit.Position.Y - myHrp.Position.Y) > 9) and -160 or 8
+		score += (math.abs(floorHit.Position.Y - myHrp.Position.Y) > 9.5) and -160 or 8
 	else
 		score += 12
 	end
@@ -596,61 +656,107 @@ local function pickBestPassTarget(myChar, myHrp, urgentMode)
 	return bestPlr, bestHrp
 end
 
-local function handleVerticalEnemy(myChar, myHrp, myHum, targetHrp, iHaveBomb, urgentMode, dt)
-	local heightAbove = targetHrp.Position.Y - myHrp.Position.Y
-	if heightAbove <= 3.2 then return false end
+local function syncVerticalLevel(myChar, myHrp, myHum, targetHrp, iHaveBomb, urgentMode, dt)
+	local dy = targetHrp.Position.Y - myHrp.Position.Y
 	local toTarget = targetHrp.Position - myHrp.Position
 	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
 	local flatDist = flat.Magnitude
 	local directDir = (flatDist > 0.05) and flat.Unit or Vector3.new(1, 0, 0)
-	local preferDropBait = iHaveBomb and (urgentMode or heightAbove > 7.5 or flatDist < 7)
-	if not preferDropBait then
+
+	if dy > 3.2 then
+		setModeTag("CLIMB UP")
+		local preferDropBait = iHaveBomb and (urgentMode or dy > 8.0 or flatDist < 6.5)
+		if preferDropBait then
+			local orbitDir = rotateFlatVector(directDir, (72 * jukeSign) + math.sin(arcPhaseClock * 6.5) * 36)
+			local baitPos = Vector3.new(targetHrp.Position.X, myHrp.Position.Y, targetHrp.Position.Z) + orbitDir * 5
+			local safeBaitDir = sanitizeDirection(myChar, myHrp, myHum, (baitPos - myHrp.Position).Unit, false)
+			currentTurnRate = 15.0
+			applyAIMove(myHrp, myHum, safeBaitDir, baitPos, nil, dt)
+			return true
+		end
+
 		local ascentSpot = findAscentSpot(myChar, myHrp, targetHrp)
 		if ascentSpot then
 			local spotFlat = Vector3.new(ascentSpot.X - myHrp.Position.X, 0, ascentSpot.Z - myHrp.Position.Z)
-			local safeClimb = sanitizeDirection(myChar, myHrp, myHum, (spotFlat.Magnitude > 0.05) and spotFlat.Unit or directDir)
-			currentTurnRate = urgentMode and 16.5 or 13.5
+			local safeClimb = sanitizeDirection(myChar, myHrp, myHum, (spotFlat.Magnitude > 0.05) and spotFlat.Unit or directDir, true)
+			currentTurnRate = urgentMode and 17.5 or 14.5
 			applyAIMove(myHrp, myHum, safeClimb, ascentSpot, targetHrp.Position, dt)
-			triggerJumpSkill(myHum, 0.50, safeClimb)
+			triggerJumpSkill(myHum, 0.46, safeClimb)
 			return true
 		end
+
 		if pathComputeTimer <= 0 or #cachedWaypoints == 0 then
 			pathComputeTimer = 0.35
 			local wps = computeSmartPath(myHrp.Position, targetHrp.Position)
 			if wps and #wps >= 2 then cachedWaypoints, waypointIndex = wps, 2 end
 		end
+
 		if cachedWaypoints[waypointIndex] then
 			local wp = cachedWaypoints[waypointIndex]
 			local wpFlat = Vector3.new(wp.Position.X - myHrp.Position.X, 0, wp.Position.Z - myHrp.Position.Z)
 			if wpFlat.Magnitude < 3.5 then
 				waypointIndex += 1
 			else
-				local stepDir = sanitizeDirection(myChar, myHrp, myHum, wpFlat.Unit)
-				currentTurnRate = urgentMode and 16.5 or 13.5
+				local stepDir = sanitizeDirection(myChar, myHrp, myHum, wpFlat.Unit, true)
+				currentTurnRate = urgentMode and 17.5 or 14.5
 				applyAIMove(myHrp, myHum, stepDir, wp.Position, targetHrp.Position, dt)
-				if wp.Action == Enum.PathWaypointAction.Jump or wp.Position.Y > myHrp.Position.Y + 1.5 then
-					triggerJumpSkill(myHum, 0.50, stepDir)
+				if wp.Action == Enum.PathWaypointAction.Jump or wp.Position.Y > myHrp.Position.Y + 1.4 then
+					triggerJumpSkill(myHum, 0.46, stepDir)
 				end
 				return true
 			end
 		end
-		local safeDirect = sanitizeDirection(myChar, myHrp, myHum, directDir)
-		currentTurnRate = urgentMode and 16.5 or 13.5
+
+		local safeDirect = sanitizeDirection(myChar, myHrp, myHum, directDir, true)
+		currentTurnRate = urgentMode and 17.5 or 14.5
 		applyAIMove(myHrp, myHum, safeDirect, myHrp.Position + safeDirect * 11, targetHrp.Position, dt)
-		if flatDist < 15 then triggerJumpSkill(myHum, 0.52, safeDirect) end
-		return true
-	else
-		local orbitDir = rotateFlatVector(directDir, (70 * jukeSign) + math.sin(arcPhaseClock * 6.4) * 38)
-		local baitPos = Vector3.new(targetHrp.Position.X, myHrp.Position.Y, targetHrp.Position.Z) + orbitDir * 5
-		local safeBaitDir = sanitizeDirection(myChar, myHrp, myHum, (baitPos - myHrp.Position).Unit)
-		currentTurnRate = 15.0
-		applyAIMove(myHrp, myHum, safeBaitDir, baitPos, nil, dt)
+		triggerJumpSkill(myHum, 0.48, safeDirect)
 		return true
 	end
+
+	if dy < -3.2 then
+		setModeTag("DROP DOWN")
+		local descentSpot = findDescentSpot(myChar, myHrp, targetHrp)
+		if descentSpot then
+			local dropFlat = Vector3.new(descentSpot.X - myHrp.Position.X, 0, descentSpot.Z - myHrp.Position.Z)
+			local dropDir = (dropFlat.Magnitude > 0.05) and dropFlat.Unit or directDir
+			local safeDrop = sanitizeDirection(myChar, myHrp, myHum, dropDir, true)
+			currentTurnRate = urgentMode and 17.5 or 14.5
+			applyAIMove(myHrp, myHum, safeDrop, descentSpot, targetHrp.Position, dt)
+			return true
+		end
+
+		if pathComputeTimer <= 0 or #cachedWaypoints == 0 then
+			pathComputeTimer = 0.35
+			local wps = computeSmartPath(myHrp.Position, targetHrp.Position)
+			if wps and #wps >= 2 then cachedWaypoints, waypointIndex = wps, 2 end
+		end
+
+		if cachedWaypoints[waypointIndex] then
+			local wp = cachedWaypoints[waypointIndex]
+			local wpFlat = Vector3.new(wp.Position.X - myHrp.Position.X, 0, wp.Position.Z - myHrp.Position.Z)
+			if wpFlat.Magnitude < 3.5 then
+				waypointIndex += 1
+			else
+				local stepDir = sanitizeDirection(myChar, myHrp, myHum, wpFlat.Unit, true)
+				currentTurnRate = urgentMode and 17.5 or 14.5
+				applyAIMove(myHrp, myHum, stepDir, wp.Position, targetHrp.Position, dt)
+				return true
+			end
+		end
+
+		local safeDownDir = sanitizeDirection(myChar, myHrp, myHum, directDir, true)
+		currentTurnRate = urgentMode and 17.5 or 14.5
+		applyAIMove(myHrp, myHum, safeDownDir, targetHrp.Position, targetHrp.Position, dt)
+		return true
+	end
+
+	return false
 end
 
 local function chaseAndPassToTarget(myChar, myHrp, myHum, targetHrp, urgentMode, dt)
-	if handleVerticalEnemy(myChar, myHrp, myHum, targetHrp, true, urgentMode, dt) then return end
+	if syncVerticalLevel(myChar, myHrp, myHum, targetHrp, true, urgentMode, dt) then return end
+	setModeTag("CHASE PASS")
 	local cutOffPos, flatVel = computeInterceptPoint(myHrp, myHum, targetHrp, urgentMode)
 	local toTarget = targetHrp.Position - myHrp.Position
 	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
@@ -698,53 +804,99 @@ local function chaseAndPassToTarget(myChar, myHrp, myHum, targetHrp, urgentMode,
 	if toTarget.Y > 2.2 then triggerJumpSkill(myHum, 0.50, chosenDir) end
 end
 
-local function buildLegendaryJukeDir(awayDir, bestSafeDir)
+local function buildGroundJukeDir(awayDir, bestSafeDir)
 	local sideDir = Vector3.new(-awayDir.Z * jukeSign, 0, awayDir.X * jukeSign)
-	local smoothWave = math.sin(arcPhaseClock * 10.0) * 0.30
-	if jukePhase == "bait" then
-		return (sideDir * (0.88 + smoothWave) + bestSafeDir * 0.42 + awayDir * 0.12).Unit
-	elseif jukePhase == "snap" then
-		local oppositeSide = Vector3.new(-awayDir.Z * (-jukeSign), 0, awayDir.X * (-jukeSign))
-		return (oppositeSide * (0.98 - smoothWave) + awayDir * 0.62 + bestSafeDir * 0.28).Unit
-	elseif jukePhase == "orbit" then
-		return (rotateFlatVector(sideDir, 36 * math.sin(arcPhaseClock * 8.2) * jukeSign) * 0.86 + awayDir * 0.58 + bestSafeDir * 0.26).Unit
-	elseif jukePhase == "zig_snap" then
-		local zigPulse = (math.floor(arcPhaseClock * 8.5) % 2 == 0) and 1 or -1
-		return (rotateFlatVector(sideDir, 46 * zigPulse) * 0.92 + awayDir * 0.54 + bestSafeDir * 0.24).Unit
-	elseif jukePhase == "feint_hook" then
-		return (rotateFlatVector(awayDir, 56 * jukeSign) * 0.80 + bestSafeDir * 0.64).Unit
-	elseif jukePhase == "dash_flank" then
-		return (rotateFlatVector(awayDir, 68 * jukeSign + math.cos(arcPhaseClock * 9.0) * 18) * 0.85 + bestSafeDir * 0.50).Unit
-	elseif jukePhase == "backstep_feint" then
-		return (rotateFlatVector(awayDir, 115 * jukeSign + math.sin(arcPhaseClock * 8.0) * 15) * 0.86 + bestSafeDir * 0.58).Unit
-	else
-		return (bestSafeDir * 0.66 + awayDir * 0.38 + sideDir * (0.56 + smoothWave)).Unit
+	local oppSideDir = Vector3.new(-awayDir.Z * (-jukeSign), 0, awayDir.X * (-jukeSign))
+	local waveFast = math.sin(arcPhaseClock * 11.0) * 0.32
+	local waveSlow = math.cos(arcPhaseClock * 6.5) * 0.25
+
+	if jukePhase == "ground_bait_drift" then
+		return (sideDir * (0.90 + waveSlow) + bestSafeDir * 0.38 + awayDir * 0.14).Unit
+	elseif jukePhase == "ground_snap_cut" then
+		return (oppSideDir * (0.98 - waveFast) + awayDir * 0.65 + bestSafeDir * 0.28).Unit
+	elseif jukePhase == "ground_crescent_arc" then
+		return (rotateFlatVector(sideDir, 38 * math.sin(arcPhaseClock * 8.5) * jukeSign) * 0.88 + awayDir * 0.58 + bestSafeDir * 0.25).Unit
+	elseif jukePhase == "ground_zig_pulse" then
+		local pulse = (math.floor(arcPhaseClock * 9.0) % 2 == 0) and 1 or -1
+		return (rotateFlatVector(sideDir, 48 * pulse) * 0.94 + awayDir * 0.52 + bestSafeDir * 0.24).Unit
+	elseif jukePhase == "ground_hook_feint" then
+		return (rotateFlatVector(awayDir, 58 * jukeSign) * 0.82 + bestSafeDir * 0.62).Unit
+	elseif jukePhase == "ground_flank_dash" then
+		return (rotateFlatVector(awayDir, 72 * jukeSign + math.cos(arcPhaseClock * 9.5) * 16) * 0.86 + bestSafeDir * 0.50).Unit
+	elseif jukePhase == "ground_pivot_backstep" then
+		return (rotateFlatVector(awayDir, 122 * jukeSign + math.sin(arcPhaseClock * 8.5) * 14) * 0.88 + bestSafeDir * 0.56).Unit
+	elseif jukePhase == "ground_serpentine_weave" then
+		local weaveDeg = math.sin(arcPhaseClock * 12.5) * 52 * jukeSign
+		return (rotateFlatVector(awayDir, weaveDeg) * 0.78 + sideDir * 0.58 + bestSafeDir * 0.34).Unit
+	elseif jukePhase == "ground_stop_and_slip" then
+		local slipAngle = (math.floor(arcPhaseClock * 5.0) % 2 == 0) and (82 * jukeSign) or (-65 * jukeSign)
+		return (rotateFlatVector(awayDir, slipAngle) * 0.84 + bestSafeDir * 0.55).Unit
+	elseif jukePhase == "ground_wide_sweep" then
+		return (rotateFlatVector(sideDir, 24 * jukeSign) * 0.95 + awayDir * 0.45 + bestSafeDir * 0.40).Unit
 	end
+
+	return (bestSafeDir * 0.66 + awayDir * 0.38 + sideDir * (0.56 + waveSlow)).Unit
+end
+
+local function buildJumpJukeDir(awayDir, bestSafeDir)
+	local sideDir = Vector3.new(-awayDir.Z * jukeSign, 0, awayDir.X * jukeSign)
+	local oppSideDir = Vector3.new(-awayDir.Z * (-jukeSign), 0, awayDir.X * (-jukeSign))
+	local hopWave = math.sin(arcPhaseClock * 10.5) * 0.28
+
+	if jukePhase == "jump_snap_cross" then
+		return (oppSideDir * 0.96 + awayDir * 0.64 + bestSafeDir * 0.28).Unit
+	elseif jukePhase == "jump_flank_vault" then
+		return (rotateFlatVector(awayDir, 66 * jukeSign) * 0.86 + bestSafeDir * 0.54).Unit
+	elseif jukePhase == "jump_crescent_hop" then
+		return (rotateFlatVector(sideDir, 34 * jukeSign + hopWave * 40) * 0.90 + awayDir * 0.55).Unit
+	elseif jukePhase == "jump_feint_hop" then
+		return (rotateFlatVector(sideDir, -35 * jukeSign) * 0.85 + bestSafeDir * 0.55).Unit
+	elseif jukePhase == "jump_back_angle" then
+		return (rotateFlatVector(awayDir, 118 * jukeSign) * 0.88 + bestSafeDir * 0.52).Unit
+	elseif jukePhase == "jump_zig_hop" then
+		local zig = (math.floor(arcPhaseClock * 8.0) % 2 == 0) and 45 or -45
+		return (rotateFlatVector(awayDir, zig * jukeSign) * 0.82 + bestSafeDir * 0.52).Unit
+	elseif jukePhase == "jump_gap_slip" then
+		return (bestSafeDir * 0.78 + sideDir * (0.48 + hopWave)).Unit
+	elseif jukePhase == "jump_over_pressure" then
+		return (rotateFlatVector(awayDir, 52 * jukeSign) * 0.88 + bestSafeDir * 0.50).Unit
+	end
+
+	return (bestSafeDir * 0.65 + awayDir * 0.45 + sideDir * 0.52).Unit
+end
+
+local function buildLegendaryJukeDir(awayDir, bestSafeDir)
+	if jukeIsJumpMode then
+		return buildJumpJukeDir(awayDir, bestSafeDir)
+	end
+	return buildGroundJukeDir(awayDir, bestSafeDir)
 end
 
 local function pickNextJukePattern(nearestDist, threatApproaching, urgentTimer)
-	local roll = math.random(1, 100)
 	local rateBoost = urgentTimer and 1.5 or 0
-	if nearestDist < 13 then
-		if threatApproaching and roll <= 28 then jukePhase, jukeTimer, currentTurnRate = "backstep_feint", math.random(20, 32) / 100, 16.5 + rateBoost
-		elseif roll <= 56 then jukePhase, jukeTimer, currentTurnRate = "snap", math.random(20, 32) / 100, 16.5 + rateBoost
-		elseif roll <= 82 then jukePhase, jukeTimer, currentTurnRate = "zig_snap", math.random(24, 36) / 100, 16.0 + rateBoost
-		else jukePhase, jukeTimer, currentTurnRate = "feint_hook", math.random(22, 34) / 100, 15.5 + rateBoost end
-	elseif nearestDist < 20 then
-		if jukePhase == "bait" then jukePhase, jukeTimer, currentTurnRate = "snap", math.random(22, 34) / 100, 16.0 + rateBoost
-		elseif roll <= 28 then jukePhase, jukeTimer, currentTurnRate = "bait", math.random(13, 21) / 100, 14.0 + rateBoost
-		elseif roll <= 58 then jukePhase, jukeTimer, currentTurnRate = "dash_flank", math.random(24, 38) / 100, 14.5 + rateBoost
-		elseif roll <= 82 then jukePhase, jukeTimer, currentTurnRate = "orbit", math.random(26, 40) / 100, 13.5 + rateBoost
-		else jukePhase, jukeTimer, currentTurnRate = "backstep_feint", math.random(20, 32) / 100, 15.0 + rateBoost end
+	local jumpChance = urgentTimer and 45 or (nearestDist < 13 and 38 or (threatApproaching and 32 or 22))
+	jukeIsJumpMode = (math.random(1, 100) <= jumpChance)
+
+	if jukeIsJumpMode then
+		local idx = math.random(1, #JUMP_JUKE_PATTERNS)
+		jukePhase = JUMP_JUKE_PATTERNS[idx]
+		jukeTimer = math.random(22, 36) / 100
+		currentTurnRate = 16.5 + rateBoost
+		setModeTag("JUMP JUKE")
 	else
-		if roll <= 45 then jukePhase, jukeTimer, currentTurnRate = "orbit", math.random(26, 42) / 100, 13.0 + rateBoost
-		elseif roll <= 75 then jukePhase, jukeTimer, currentTurnRate = "dash_flank", math.random(24, 38) / 100, 13.5 + rateBoost
-		else jukePhase, jukeTimer, currentTurnRate = "zig_snap", math.random(22, 34) / 100, 14.5 + rateBoost end
+		local idx = math.random(1, #GROUND_JUKE_PATTERNS)
+		jukePhase = GROUND_JUKE_PATTERNS[idx]
+		jukeTimer = math.random(18, 38) / 100
+		currentTurnRate = (nearestDist < 14 and 16.2 or 14.2) + rateBoost
+		setModeTag("GROUND JUKE")
 	end
 end
 
 local function runSmartAI(myChar, myHrp, myHum, dt)
-	if not Config.AI or not isInMatch(myChar, myHrp) then return end
+	if not Config.AI or not isInMatch(myChar, myHrp) then
+		setModeTag("STANDBY")
+		return
+	end
 	arcPhaseClock += dt
 	jukeTimer = math.max(0, jukeTimer - dt)
 	jumpCooldown = math.max(0, jumpCooldown - dt)
@@ -759,12 +911,14 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 	lastPos = myHrp.Position
 
 	if stuckTimer > 0.28 then
-		stuckTimer, jukeSign, jukePhase, jukeTimer, currentTurnRate, cachedWaypoints = 0, -jukeSign, "snap", 0.28, 17.0, {}
-		triggerJumpSkill(myHum, 0.50, rotateFlatVector(currentMoveDir, 52 * jukeSign))
+		stuckTimer, jukeSign, jukeIsJumpMode, jukePhase, jukeTimer, currentTurnRate, cachedWaypoints = 0, -jukeSign, true, "jump_snap_cross", 0.28, 17.5, {}
+		setModeTag("JUMP JUKE")
+		triggerJumpSkill(myHum, 0.48, rotateFlatVector(currentMoveDir, 52 * jukeSign))
 	end
 
 	if hasBomb(myChar) then
 		jukePhase = "none"
+		jukeIsJumpMode = false
 		local myBombTime = getRemainingBombTime(myChar)
 		local urgentPass = (myBombTime ~= nil and myBombTime <= 4.0)
 		local lockedChar, lockedHrp = getCharacterParts(currentTargetPlr)
@@ -777,6 +931,7 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 		if lockedHrp then
 			chaseAndPassToTarget(myChar, myHrp, myHum, lockedHrp, urgentPass, dt)
 		else
+			setModeTag("ROAM")
 			local safeRoam = sanitizeDirection(myChar, myHrp, myHum, currentMoveDir)
 			applyAIMove(myHrp, myHum, safeRoam, myHrp.Position + safeRoam * 8, nil, dt)
 		end
@@ -788,8 +943,8 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 		local bombTimeLeft = (primaryThreat and primaryThreat.hasBomb) and primaryThreat.bombTime or nil
 		local urgentTimer = (bombTimeLeft ~= nil and bombTimeLeft <= 3.5)
 
-		if threatHrp and (threatHrp.Position.Y - myHrp.Position.Y) > 3.5 and nearestDist <= Config.AIDodgeDist then
-			handleVerticalEnemy(myChar, myHrp, myHum, threatHrp, false, urgentTimer, dt)
+		if threatHrp and nearestDist <= Config.AIDodgeDist and math.abs(threatHrp.Position.Y - myHrp.Position.Y) > 3.5 then
+			syncVerticalLevel(myChar, myHrp, myHum, threatHrp, false, urgentTimer, dt)
 			return
 		end
 
@@ -800,20 +955,22 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 		)
 
 		if highDangerNow then
+			setModeTag("EVADE")
 			local awayFlat = Vector3.new(myHrp.Position.X - threatHrp.Position.X, 0, myHrp.Position.Z - threatHrp.Position.Z)
 			local awayDir = (awayFlat.Magnitude > 0.05) and awayFlat.Unit or Vector3.new(1, 0, 0)
 			local quickFlip = (math.floor(arcPhaseClock * (urgentTimer and 11 or 9)) % 2 == 0) and 1 or -1
 			local safeEscape = sanitizeDirection(myChar, myHrp, myHum, rotateFlatVector(awayDir, (48 * jukeSign * quickFlip) + math.sin(arcPhaseClock * 10) * 20))
 			currentTurnRate = urgentTimer and 19.0 or 17.0
 			applyAIMove(myHrp, myHum, safeEscape, myHrp.Position + safeEscape * 13, myHrp.Position + safeEscape * 9, dt)
-			if nearestDist < 12 and math.random(1, 100) <= (urgentTimer and 80 or 68) then
-				triggerJumpSkill(myHum, 0.50, safeEscape)
+			if nearestDist < 12 and math.random(1, 100) <= (urgentTimer and 75 or 55) then
+				triggerJumpSkill(myHum, 0.48, safeEscape)
 				jukeSign = -jukeSign
 			end
 			return
 		end
 
 		if Config.AILock and lockedMoveDir then
+			setModeTag("LOCKED")
 			local safeLocked = sanitizeDirection(myChar, myHrp, myHum, lockedMoveDir)
 			currentTurnRate = 15.5
 			applyAIMove(myHrp, myHum, safeLocked, myHrp.Position + safeLocked * 12, myHrp.Position + safeLocked * 9, dt)
@@ -843,12 +1000,17 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 			local safeJuke = sanitizeDirection(myChar, myHrp, myHum, buildLegendaryJukeDir(awayDir, bestDir))
 			lockedMoveDir = safeJuke
 			applyAIMove(myHrp, myHum, safeJuke, myHrp.Position + safeJuke * 12, (nearestDist < 14 or urgentTimer) and (myHrp.Position + safeJuke * 9) or nil, dt)
-			if nearestDist < 13.5 and approachingMe and math.random(1, 100) <= 65 then
-				jukeSign, jukePhase, jukeTimer, currentTurnRate = -jukeSign, "snap", 0.25, 17.5
-				triggerJumpSkill(myHum, 0.50, rotateFlatVector(safeJuke, 40 * jukeSign))
+
+			if jukeIsJumpMode and nearestDist < 19 then
+				triggerJumpSkill(myHum, 0.48, safeJuke)
+			elseif nearestDist < 13.5 and approachingMe and math.random(1, 100) <= 55 then
+				jukeSign, jukeIsJumpMode, jukePhase, jukeTimer, currentTurnRate = -jukeSign, true, "jump_snap_cross", 0.25, 17.5
+				setModeTag("JUMP JUKE")
+				triggerJumpSkill(myHum, 0.48, rotateFlatVector(safeJuke, 40 * jukeSign))
 			end
 		else
-			jukePhase, currentTurnRate = "none", 11.5
+			jukePhase, jukeIsJumpMode, currentTurnRate = "none", false, 11.5
+			setModeTag("ROAM")
 			if jukeTimer <= 0 then
 				jukeTimer = math.random(35, 60) / 100
 				if math.random(1, 100) <= 45 then jukeSign = -jukeSign end
@@ -866,7 +1028,7 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 end
 
 -- =========================================================
--- 4) واجهة التحكم
+-- 4) واجهة التحكم المحسّنة
 -- =========================================================
 local function buildUI()
 	local oldGui = playerGui:FindFirstChild("MatchPanelUI")
@@ -879,50 +1041,75 @@ local function buildUI()
 	ScreenGui.DisplayOrder = 5000
 	ScreenGui.Parent = playerGui
 
-	local HEADER_HEIGHT = 44
-	local ROW_HEIGHT = 42
+	local HEADER_HEIGHT = 48
+	local STATUS_HEIGHT = 24
+	local ROW_HEIGHT = 40
 	local ROW_GAP = 6
-	local FULL_HEIGHT = HEADER_HEIGHT + 12 + (4 * ROW_HEIGHT) + (3 * ROW_GAP)
+	local FULL_HEIGHT = HEADER_HEIGHT + STATUS_HEIGHT + 16 + (4 * ROW_HEIGHT) + (3 * ROW_GAP)
 
 	local MainFrame = Instance.new("Frame")
-	MainFrame.Size = UDim2.new(0, 280, 0, FULL_HEIGHT)
-	MainFrame.Position = UDim2.new(0.24, 0, 0.18, 0)
-	MainFrame.BackgroundColor3 = Color3.fromRGB(16, 17, 24)
+	MainFrame.Size = UDim2.new(0, 292, 0, FULL_HEIGHT)
+	MainFrame.Position = UDim2.new(0.22, 0, 0.16, 0)
+	MainFrame.BackgroundColor3 = Color3.fromRGB(14, 16, 24)
 	MainFrame.BorderSizePixel = 0
 	MainFrame.Active = true
 	MainFrame.Draggable = true
 	MainFrame.Parent = ScreenGui
-	Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 14)
+	Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 16)
+
+	local MainGrad = Instance.new("UIGradient")
+	MainGrad.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 25, 38)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(12, 14, 21))
+	})
+	MainGrad.Rotation = 90
+	MainGrad.Parent = MainFrame
 
 	local MainStroke = Instance.new("UIStroke")
 	MainStroke.Thickness = 1.6
-	MainStroke.Color = Color3.fromRGB(95, 110, 255)
+	MainStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	MainStroke.Parent = MainFrame
 
+	local StrokeGrad = Instance.new("UIGradient")
+	StrokeGrad.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(110, 130, 255)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(45, 215, 190))
+	})
+	StrokeGrad.Parent = MainStroke
+
 	local Header = Instance.new("Frame")
-	Header.Size = UDim2.new(1, 0, 0, HEADER_HEIGHT)
-	Header.BackgroundColor3 = Color3.fromRGB(28, 30, 44)
+	Header.Size = UDim2.new(1, -10, 0, HEADER_HEIGHT)
+	Header.Position = UDim2.new(0, 5, 0, 5)
+	Header.BackgroundColor3 = Color3.fromRGB(26, 30, 46)
 	Header.BorderSizePixel = 0
 	Header.Parent = MainFrame
-	Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 14)
+	Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 12)
+
+	local AccentBar = Instance.new("Frame")
+	AccentBar.Size = UDim2.new(0, 4, 0, 28)
+	AccentBar.Position = UDim2.new(0, 8, 0.5, -14)
+	AccentBar.BackgroundColor3 = Color3.fromRGB(85, 225, 195)
+	AccentBar.BorderSizePixel = 0
+	AccentBar.Parent = Header
+	Instance.new("UICorner", AccentBar).CornerRadius = UDim.new(1, 0)
 
 	local TitleLabel = Instance.new("TextLabel")
-	TitleLabel.Size = UDim2.new(1, -84, 0, 18)
-	TitleLabel.Position = UDim2.new(0, 12, 0, 5)
+	TitleLabel.Size = UDim2.new(1, -96, 0, 18)
+	TitleLabel.Position = UDim2.new(0, 18, 0, 6)
 	TitleLabel.BackgroundTransparency = 1
 	TitleLabel.Text = "MATCH | SMART CONTROL"
-	TitleLabel.TextColor3 = Color3.fromRGB(245, 247, 255)
+	TitleLabel.TextColor3 = Color3.fromRGB(248, 250, 255)
 	TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 	TitleLabel.Font = Enum.Font.GothamBlack
 	TitleLabel.TextSize = 13
 	TitleLabel.Parent = Header
 
 	local SubLabel = Instance.new("TextLabel")
-	SubLabel.Size = UDim2.new(1, -84, 0, 14)
-	SubLabel.Position = UDim2.new(0, 12, 0, 24)
+	SubLabel.Size = UDim2.new(1, -96, 0, 14)
+	SubLabel.Position = UDim2.new(0, 18, 0, 25)
 	SubLabel.BackgroundTransparency = 1
-	SubLabel.Text = "Arena • Evade • Pass • Style"
-	SubLabel.TextColor3 = Color3.fromRGB(135, 145, 185)
+	SubLabel.Text = "Ground • Jump • Climb / Drop • Pass"
+	SubLabel.TextColor3 = Color3.fromRGB(145, 158, 198)
 	SubLabel.TextXAlignment = Enum.TextXAlignment.Left
 	SubLabel.Font = Enum.Font.GothamMedium
 	SubLabel.TextSize = 9
@@ -930,8 +1117,8 @@ local function buildUI()
 
 	local MinBtn = Instance.new("TextButton")
 	MinBtn.Size = UDim2.new(0, 28, 0, 28)
-	MinBtn.Position = UDim2.new(1, -66, 0, 8)
-	MinBtn.BackgroundColor3 = Color3.fromRGB(48, 52, 74)
+	MinBtn.Position = UDim2.new(1, -68, 0.5, -14)
+	MinBtn.BackgroundColor3 = Color3.fromRGB(45, 50, 74)
 	MinBtn.Text = "-"
 	MinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 	MinBtn.Font = Enum.Font.GothamBold
@@ -941,8 +1128,8 @@ local function buildUI()
 
 	local CloseBtn = Instance.new("TextButton")
 	CloseBtn.Size = UDim2.new(0, 28, 0, 28)
-	CloseBtn.Position = UDim2.new(1, -34, 0, 8)
-	CloseBtn.BackgroundColor3 = Color3.fromRGB(210, 52, 70)
+	CloseBtn.Position = UDim2.new(1, -35, 0.5, -14)
+	CloseBtn.BackgroundColor3 = Color3.fromRGB(215, 55, 75)
 	CloseBtn.Text = "X"
 	CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 	CloseBtn.Font = Enum.Font.GothamBold
@@ -950,9 +1137,56 @@ local function buildUI()
 	CloseBtn.Parent = Header
 	Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
 
+	local StatusBar = Instance.new("Frame")
+	StatusBar.Size = UDim2.new(1, -16, 0, STATUS_HEIGHT)
+	StatusBar.Position = UDim2.new(0, 8, 0, HEADER_HEIGHT + 8)
+	StatusBar.BackgroundColor3 = Color3.fromRGB(21, 24, 36)
+	StatusBar.BorderSizePixel = 0
+	StatusBar.Parent = MainFrame
+	Instance.new("UICorner", StatusBar).CornerRadius = UDim.new(0, 8)
+
+	local StatusDot = Instance.new("Frame")
+	StatusDot.Size = UDim2.new(0, 8, 0, 8)
+	StatusDot.Position = UDim2.new(0, 10, 0.5, -4)
+	StatusDot.BackgroundColor3 = Color3.fromRGB(120, 130, 160)
+	StatusDot.BorderSizePixel = 0
+	StatusDot.Parent = StatusBar
+	Instance.new("UICorner", StatusDot).CornerRadius = UDim.new(1, 0)
+
+	local StatusText = Instance.new("TextLabel")
+	StatusText.Size = UDim2.new(1, -24, 1, 0)
+	StatusText.Position = UDim2.new(0, 24, 0, 0)
+	StatusText.BackgroundTransparency = 1
+	StatusText.Text = "AI STATUS : IDLE"
+	StatusText.TextColor3 = Color3.fromRGB(165, 178, 215)
+	StatusText.TextXAlignment = Enum.TextXAlignment.Left
+	StatusText.Font = Enum.Font.GothamBold
+	StatusText.TextSize = 10
+	StatusText.Parent = StatusBar
+
+	uiStatusUpdater = function(tag)
+		if not Config.AI then
+			StatusText.Text = "AI STATUS : OFF"
+			StatusText.TextColor3 = Color3.fromRGB(155, 165, 195)
+			StatusDot.BackgroundColor3 = Color3.fromRGB(115, 125, 155)
+			return
+		end
+		StatusText.Text = "AI STATUS : " .. tostring(tag)
+		if tag == "JUMP JUKE" or tag == "CLIMB UP" then
+			StatusText.TextColor3 = Color3.fromRGB(120, 235, 255)
+			StatusDot.BackgroundColor3 = Color3.fromRGB(70, 210, 255)
+		elseif tag == "DROP DOWN" or tag == "EVADE" then
+			StatusText.TextColor3 = Color3.fromRGB(255, 200, 95)
+			StatusDot.BackgroundColor3 = Color3.fromRGB(255, 180, 60)
+		else
+			StatusText.TextColor3 = Color3.fromRGB(115, 245, 175)
+			StatusDot.BackgroundColor3 = Color3.fromRGB(55, 215, 130)
+		end
+	end
+
 	local Body = Instance.new("Frame")
-	Body.Size = UDim2.new(1, -16, 0, FULL_HEIGHT - HEADER_HEIGHT - 12)
-	Body.Position = UDim2.new(0, 8, 0, HEADER_HEIGHT + 6)
+	Body.Size = UDim2.new(1, -16, 0, (4 * ROW_HEIGHT) + (3 * ROW_GAP))
+	Body.Position = UDim2.new(0, 8, 0, HEADER_HEIGHT + STATUS_HEIGHT + 14)
 	Body.BackgroundTransparency = 1
 	Body.Parent = MainFrame
 
@@ -965,21 +1199,26 @@ local function buildUI()
 		local row = Instance.new("Frame")
 		row.Name = keyName .. "Row"
 		row.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
-		row.BackgroundColor3 = Color3.fromRGB(27, 29, 41)
+		row.BackgroundColor3 = Color3.fromRGB(24, 27, 40)
 		row.BorderSizePixel = 0
 		row.LayoutOrder = order
 		row.Parent = Body
 		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
 
+		local rowStroke = Instance.new("UIStroke")
+		rowStroke.Thickness = 1
+		rowStroke.Color = Color3.fromRGB(42, 47, 68)
+		rowStroke.Parent = row
+
 		local hasStepper = valueConfig ~= nil
-		local toggleWidth = hasStepper and 130 or 248
+		local toggleWidth = hasStepper and 136 or 260
 
 		local toggleBtn = Instance.new("TextButton")
 		toggleBtn.Size = UDim2.new(0, toggleWidth, 1, -8)
 		toggleBtn.Position = UDim2.new(0, 4, 0, 4)
-		toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 43, 60)
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(37, 41, 60)
 		toggleBtn.Text = title .. " : OFF"
-		toggleBtn.TextColor3 = Color3.fromRGB(250, 250, 255)
+		toggleBtn.TextColor3 = Color3.fromRGB(245, 248, 255)
 		toggleBtn.Font = Enum.Font.GothamBold
 		toggleBtn.TextSize = 11
 		toggleBtn.Parent = row
@@ -989,7 +1228,8 @@ local function buildUI()
 		local function setState(newState)
 			state = newState
 			toggleBtn.Text = title .. (state and " : ON" or " : OFF")
-			toggleBtn.BackgroundColor3 = state and Color3.fromRGB(28, 155, 95) or Color3.fromRGB(40, 43, 60)
+			toggleBtn.BackgroundColor3 = state and Color3.fromRGB(26, 155, 98) or Color3.fromRGB(37, 41, 60)
+			rowStroke.Color = state and Color3.fromRGB(48, 195, 130) or Color3.fromRGB(42, 47, 68)
 			onToggle(state)
 		end
 
@@ -999,8 +1239,8 @@ local function buildUI()
 		if hasStepper then
 			local minusBtn = Instance.new("TextButton")
 			minusBtn.Size = UDim2.new(0, 28, 1, -8)
-			minusBtn.Position = UDim2.new(0, 138, 0, 4)
-			minusBtn.BackgroundColor3 = Color3.fromRGB(58, 62, 86)
+			minusBtn.Position = UDim2.new(0, 144, 0, 4)
+			minusBtn.BackgroundColor3 = Color3.fromRGB(54, 59, 84)
 			minusBtn.Text = "-"
 			minusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 			minusBtn.Font = Enum.Font.GothamBlack
@@ -1009,11 +1249,11 @@ local function buildUI()
 			Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 8)
 
 			local valLabel = Instance.new("TextLabel")
-			valLabel.Size = UDim2.new(0, 52, 1, -8)
-			valLabel.Position = UDim2.new(0, 168, 0, 4)
-			valLabel.BackgroundColor3 = Color3.fromRGB(19, 21, 30)
+			valLabel.Size = UDim2.new(0, 54, 1, -8)
+			valLabel.Position = UDim2.new(0, 175, 0, 4)
+			valLabel.BackgroundColor3 = Color3.fromRGB(16, 18, 28)
 			valLabel.Text = tostring(Config[valueConfig.key])
-			valLabel.TextColor3 = Color3.fromRGB(130, 220, 255)
+			valLabel.TextColor3 = Color3.fromRGB(115, 225, 255)
 			valLabel.Font = Enum.Font.GothamBold
 			valLabel.TextSize = 11
 			valLabel.Parent = row
@@ -1021,8 +1261,8 @@ local function buildUI()
 
 			local plusBtn = Instance.new("TextButton")
 			plusBtn.Size = UDim2.new(0, 28, 1, -8)
-			plusBtn.Position = UDim2.new(0, 222, 0, 4)
-			plusBtn.BackgroundColor3 = Color3.fromRGB(78, 92, 235)
+			plusBtn.Position = UDim2.new(0, 232, 0, 4)
+			plusBtn.BackgroundColor3 = Color3.fromRGB(82, 98, 240)
 			plusBtn.Text = "+"
 			plusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 			plusBtn.Font = Enum.Font.GothamBlack
@@ -1047,7 +1287,8 @@ local function buildUI()
 
 	createFeatureRow("ai", 2, "Smart AI", { key = "AIDodgeDist", min = 12, max = 60, step = 4 }, function(s)
 		Config.AI = s
-		cachedWaypoints, jukePhase = {}, "none"
+		cachedWaypoints, jukePhase, jukeIsJumpMode = {}, "none", false
+		setModeTag(s and "ROAM" or "OFF")
 		if not s then
 			if rowRefs.lock then rowRefs.lock.setState(false) end
 			local myChar, _, myHum = getCharacterParts(LocalPlayer)
@@ -1075,9 +1316,10 @@ local function buildUI()
 	local minimized = false
 	MinBtn.MouseButton1Click:Connect(function()
 		minimized = not minimized
+		StatusBar.Visible = not minimized
 		Body.Visible = not minimized
 		MinBtn.Text = minimized and "+" or "-"
-		MainFrame.Size = minimized and UDim2.new(0, 280, 0, HEADER_HEIGHT) or UDim2.new(0, 280, 0, FULL_HEIGHT)
+		MainFrame.Size = minimized and UDim2.new(0, 292, 0, HEADER_HEIGHT + 10) or UDim2.new(0, 292, 0, FULL_HEIGHT)
 	end)
 
 	CloseBtn.MouseButton1Click:Connect(function()
