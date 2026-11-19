@@ -9,6 +9,7 @@ local Config = {
 	Reach = false,
 	AI = false,
 	AILock = false,
+	ShiftLock = false,
 	FF_071 = false,
 
 	ReachSize = 10,
@@ -156,9 +157,11 @@ local function isInSameArena(myChar, myHrp, targetChar, targetHrp)
 end
 
 -- =========================================================
--- 2) مظهر محلي مؤقت عند التفعيل فقط
+-- 2) مظهر محلي مؤقت عند التفعيل فقط + نظام Shift Lock حسب الحاجة
 -- =========================================================
 local savedOutfit = { Shirt = nil, Pants = nil, DisplayName = nil, Colors = {}, Saved = false }
+local savedShiftState = { AutoRotate = nil, Active = false }
+local needShiftLockNow = false
 
 local function applyCustomLocalStyle(char)
 	if not char then return end
@@ -224,6 +227,48 @@ local function restoreCustomLocalStyle(char)
 	end)
 	savedOutfit.Colors = {}
 	savedOutfit.Saved = false
+end
+
+local function restoreShiftLockState(char)
+	pcall(function()
+		if char then
+			local hum = char:FindFirstChildWhichIsA("Humanoid")
+			if hum and savedShiftState.AutoRotate ~= nil then
+				hum.AutoRotate = savedShiftState.AutoRotate
+			end
+		end
+	end)
+	savedShiftState.AutoRotate = nil
+	savedShiftState.Active = false
+end
+
+local function updateShiftLock(myChar, myHrp, myHum, dt)
+	local shouldEngage = Config.ShiftLock and needShiftLockNow
+	if not shouldEngage then
+		if savedShiftState.Active then
+			restoreShiftLockState(myChar)
+		end
+		return
+	end
+	if not myChar or not myHrp or not myHum then return end
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+
+	if not savedShiftState.Active then
+		savedShiftState.AutoRotate = myHum.AutoRotate
+		savedShiftState.Active = true
+	end
+
+	pcall(function()
+		myHum.AutoRotate = false
+		local look = cam.CFrame.LookVector
+		local flatLook = Vector3.new(look.X, 0, look.Z)
+		if flatLook.Magnitude > 0.05 then
+			local targetCF = CFrame.lookAt(myHrp.Position, myHrp.Position + flatLook.Unit)
+			local alpha = math.clamp((dt or 0.08) * 18.0, 0.2, 0.9)
+			myHrp.CFrame = myHrp.CFrame:Lerp(targetCF, alpha)
+		end
+	end)
 end
 
 -- =========================================================
@@ -598,7 +643,6 @@ local function collectThreatEntities(myChar, myHrp)
 	return candidates, primaryThreat, bombCarriers
 end
 
--- تقييم الاتجاه: حركة حرة وذكية مع استخدام الحواجز كغطاء ذكي وليس بشكل دائم
 local function evaluateDirectionScore(myChar, myHrp, dir, threats)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -634,7 +678,6 @@ local function evaluateDirectionScore(myChar, myHrp, dir, threats)
 				local timerBoost = (t.bombTime and t.bombTime <= 4.0) and 1.35 or 1.0
 				score += distFromNext * 2.55 * timerBoost
 				if distFromNext < 14 then score -= (14 - distFromNext) * 7.2 * timerBoost end
-				-- استخدام الغطاء بذكاء عند القرب الشديد أو التهديد المباشر مع تجنب الالتصاق الطويل به
 				if hasCoverBetween(myChar, nextPos, predictedPos) then
 					if distFromNext < 16 and coverHoldTimer < 0.75 then
 						score += 18
@@ -779,6 +822,10 @@ local function chaseAndPassToTarget(myChar, myHrp, myHum, targetHrp, urgentMode,
 	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
 	local distFlat = flat.Magnitude
 	local directDir = (distFlat > 0.05) and flat.Unit or Vector3.new(1, 0, 0)
+
+	if distFlat <= 12.0 or urgentMode then
+		needShiftLockNow = true
+	end
 
 	local predDelta = cutOffPos - myHrp.Position
 	local predFlat = Vector3.new(predDelta.X, 0, predDelta.Z)
@@ -933,6 +980,7 @@ local function pickNextJukePattern(nearestDist, threatApproaching, urgentTimer)
 end
 
 local function runSmartAI(myChar, myHrp, myHum, dt)
+	needShiftLockNow = false
 	if not Config.AI or not isInMatch(myChar, myHrp) then
 		setModeTag("STANDBY")
 		return
@@ -1002,6 +1050,7 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 		)
 
 		if highDangerNow then
+			needShiftLockNow = true
 			setModeTag("EVADE")
 			local awayFlat = Vector3.new(myHrp.Position.X - threatHrp.Position.X, 0, myHrp.Position.Z - threatHrp.Position.Z)
 			local awayDir = (awayFlat.Magnitude > 0.05) and awayFlat.Unit or Vector3.new(1, 0, 0)
@@ -1038,6 +1087,11 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 			local toMe = (myHrp.Position - threatHrp.Position).Unit
 			local tFlatVel = Vector3.new(threatHrp.AssemblyLinearVelocity.X, 0, threatHrp.AssemblyLinearVelocity.Z)
 			local approachingMe = (threatHrp.CFrame.LookVector:Dot(toMe) > 0.30) or (tFlatVel.Magnitude > 3 and tFlatVel.Unit:Dot(toMe) > 0.45)
+
+			if primaryThreat.hasBomb and (approachingMe or nearestDist < 15.5 or urgentTimer) then
+				needShiftLockNow = true
+			end
+
 			if jukeTimer <= 0 and humanReactionDelay <= 0 then
 				humanReactionDelay = urgentTimer and (math.random(3, 8) / 100) or (math.random(5, 13) / 100)
 				if not urgentTimer and math.random(1, 100) <= 4 then humanHesitateTimer = math.random(3, 7) / 100 end
@@ -1075,7 +1129,7 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 end
 
 -- =========================================================
--- 4) واجهة التحكم المحسّنة
+-- 4) واجهة التحكم المحسّنة + زر Shift Lock
 -- =========================================================
 local function buildUI()
 	local oldGui = playerGui:FindFirstChild("MatchPanelUI")
@@ -1088,15 +1142,16 @@ local function buildUI()
 	ScreenGui.DisplayOrder = 5000
 	ScreenGui.Parent = playerGui
 
+	local ROW_COUNT = 5
 	local HEADER_HEIGHT = 48
 	local STATUS_HEIGHT = 24
 	local ROW_HEIGHT = 40
 	local ROW_GAP = 6
-	local FULL_HEIGHT = HEADER_HEIGHT + STATUS_HEIGHT + 16 + (4 * ROW_HEIGHT) + (3 * ROW_GAP)
+	local FULL_HEIGHT = HEADER_HEIGHT + STATUS_HEIGHT + 16 + (ROW_COUNT * ROW_HEIGHT) + ((ROW_COUNT - 1) * ROW_GAP)
 
 	local MainFrame = Instance.new("Frame")
 	MainFrame.Size = UDim2.new(0, 292, 0, FULL_HEIGHT)
-	MainFrame.Position = UDim2.new(0.22, 0, 0.16, 0)
+	MainFrame.Position = UDim2.new(0.22, 0, 0.14, 0)
 	MainFrame.BackgroundColor3 = Color3.fromRGB(14, 16, 24)
 	MainFrame.BorderSizePixel = 0
 	MainFrame.Active = true
@@ -1155,7 +1210,7 @@ local function buildUI()
 	SubLabel.Size = UDim2.new(1, -96, 0, 14)
 	SubLabel.Position = UDim2.new(0, 18, 0, 25)
 	SubLabel.BackgroundTransparency = 1
-	SubLabel.Text = "Ground • Jump • Climb / Drop • Pass"
+	SubLabel.Text = "Juke • Auto Shift Lock • Climb / Drop • Pass"
 	SubLabel.TextColor3 = Color3.fromRGB(145, 158, 198)
 	SubLabel.TextXAlignment = Enum.TextXAlignment.Left
 	SubLabel.Font = Enum.Font.GothamMedium
@@ -1232,7 +1287,7 @@ local function buildUI()
 	end
 
 	local Body = Instance.new("Frame")
-	Body.Size = UDim2.new(1, -16, 0, (4 * ROW_HEIGHT) + (3 * ROW_GAP))
+	Body.Size = UDim2.new(1, -16, 0, (ROW_COUNT * ROW_HEIGHT) + ((ROW_COUNT - 1) * ROW_GAP))
 	Body.Position = UDim2.new(0, 8, 0, HEADER_HEIGHT + STATUS_HEIGHT + 14)
 	Body.BackgroundTransparency = 1
 	Body.Parent = MainFrame
@@ -1334,9 +1389,11 @@ local function buildUI()
 
 	createFeatureRow("ai", 2, "Smart AI", { key = "AIDodgeDist", min = 12, max = 60, step = 4 }, function(s)
 		Config.AI = s
+		needShiftLockNow = false
 		cachedWaypoints, jukePhase, jukeIsJumpMode, coverHoldTimer = {}, "none", false, 0
 		setModeTag(s and "ROAM" or "OFF")
 		if not s then
+			restoreShiftLockState(LocalPlayer.Character)
 			if rowRefs.lock then rowRefs.lock.setState(false) end
 			local myChar, _, myHum = getCharacterParts(LocalPlayer)
 			if myChar and myHum then myHum:MoveTo(myChar:GetPivot().Position) end
@@ -1355,7 +1412,15 @@ local function buildUI()
 		lockedMoveDir = s and currentMoveDir or nil
 	end)
 
-	createFeatureRow("ff071", 4, "FF_071", nil, function(s)
+	createFeatureRow("shiftlock", 4, "Shift Lock", nil, function(s)
+		Config.ShiftLock = s
+		if not s then
+			needShiftLockNow = false
+			restoreShiftLockState(LocalPlayer.Character)
+		end
+	end)
+
+	createFeatureRow("ff071", 5, "FF_071", nil, function(s)
 		Config.FF_071 = s
 		if s then applyCustomLocalStyle(LocalPlayer.Character) else restoreCustomLocalStyle(LocalPlayer.Character) end
 	end)
@@ -1370,7 +1435,9 @@ local function buildUI()
 	end)
 
 	CloseBtn.MouseButton1Click:Connect(function()
-		Config.Reach, Config.AI, Config.AILock, Config.FF_071 = false, false, false, false
+		Config.Reach, Config.AI, Config.AILock, Config.ShiftLock, Config.FF_071 = false, false, false, false, false
+		needShiftLockNow = false
+		restoreShiftLockState(LocalPlayer.Character)
 		restoreCustomLocalStyle(LocalPlayer.Character)
 		ScreenGui:Destroy()
 	end)
@@ -1380,6 +1447,9 @@ pcall(buildUI)
 
 LocalPlayer.CharacterAdded:Connect(function(newChar)
 	savedOutfit.Saved = false
+	savedShiftState.Active = false
+	savedShiftState.AutoRotate = nil
+	needShiftLockNow = false
 	if Config.FF_071 then
 		task.wait(0.25)
 		applyCustomLocalStyle(newChar)
@@ -1398,5 +1468,8 @@ RunService.RenderStepped:Connect(function(dt)
 	if Config.FF_071 then applyCustomLocalStyle(myChar) end
 	if Config.AI then
 		pcall(runSmartAI, myChar, myHrp, myHum, elapsed)
+	else
+		needShiftLockNow = false
 	end
+	updateShiftLock(myChar, myHrp, myHum, elapsed)
 end)
