@@ -1,0 +1,1113 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local Config = {
+	Reach = false,
+	AI = false,
+	AILock = false,
+	FF_071 = false,
+
+	ReachSize = 10,
+	AIDodgeDist = 28
+}
+
+-- =========================================================
+-- 1) فحص الفريق والساحة والقنبلة واللاعبين
+-- =========================================================
+local function isTeammate(plr)
+	if not plr or plr == LocalPlayer then return true end
+	if LocalPlayer.Team ~= nil and plr.Team ~= nil and LocalPlayer.Team == plr.Team then
+		return true
+	end
+	if LocalPlayer.TeamColor ~= nil and plr.TeamColor ~= nil and LocalPlayer.TeamColor == plr.TeamColor and not LocalPlayer.Neutral and not plr.Neutral then
+		return true
+	end
+	local myChar = LocalPlayer.Character
+	local tChar = plr.Character
+	if myChar and tChar then
+		for _, attr in ipairs({"Team", "Squad", "Faction", "Group"}) do
+			local a1 = myChar:GetAttribute(attr) or LocalPlayer:GetAttribute(attr)
+			local a2 = tChar:GetAttribute(attr) or plr:GetAttribute(attr)
+			if a1 ~= nil and a2 ~= nil and a1 == a2 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function findBombObject(char)
+	if not char then return nil end
+	for _, obj in ipairs(char:GetChildren()) do
+		if obj:IsA("Tool") then
+			local n = string.lower(obj.Name)
+			if string.find(n, "bomb") or string.find(n, "tnt") or string.find(n, "time") or string.find(n, "boom") then
+				return obj
+			end
+		end
+	end
+	for _, obj in ipairs(char:GetChildren()) do
+		if obj:IsA("Model") or obj:IsA("BasePart") then
+			local n = string.lower(obj.Name)
+			if string.find(n, "bomb") or string.find(n, "tnt") or string.find(n, "time") then
+				return obj
+			end
+		end
+	end
+	local plr = Players:GetPlayerFromCharacter(char)
+	if plr and plr:FindFirstChild("Backpack") then
+		for _, obj in ipairs(plr.Backpack:GetChildren()) do
+			if obj:IsA("Tool") then
+				local n = string.lower(obj.Name)
+				if string.find(n, "bomb") or string.find(n, "tnt") or string.find(n, "time") then
+					return obj
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function hasBomb(char)
+	return findBombObject(char) ~= nil
+end
+
+local function getRemainingBombTime(char)
+	local bombObj = findBombObject(char)
+	for _, root in ipairs({bombObj, char, workspace}) do
+		if root then
+			for _, attrName in ipairs({"Time", "Timer", "Countdown", "BombTime", "TimeLeft"}) do
+				local val = root:GetAttribute(attrName)
+				if type(val) == "number" and val > 0 and val < 120 then
+					return val
+				end
+			end
+			for _, desc in ipairs(root:GetDescendants()) do
+				if desc:IsA("NumberValue") or desc:IsA("IntValue") then
+					local ln = string.lower(desc.Name)
+					if (string.find(ln, "time") or string.find(ln, "count") or string.find(ln, "bomb")) and type(desc.Value) == "number" and desc.Value > 0 and desc.Value < 120 then
+						return desc.Value
+					end
+				elseif desc:IsA("TextLabel") then
+					local num = tonumber(string.match(desc.Text, "%d+%.?%d*"))
+					if num and num > 0 and num <= 30 then
+						return num
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function getCharacterParts(plr)
+	local char = plr and plr.Character
+	if not char then return nil, nil, nil end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildWhichIsA("Humanoid")
+	if not hrp or not hum or hum.Health <= 0 then return nil, nil, nil end
+	return char, hrp, hum
+end
+
+local function getFloorPart(char, hrp)
+	if not hrp then return nil end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local filter = {char}
+	if LocalPlayer.Character then table.insert(filter, LocalPlayer.Character) end
+	params.FilterDescendantsInstances = filter
+	local result = workspace:Raycast(hrp.Position, Vector3.new(0, -35, 0), params)
+	return result and result.Instance or nil
+end
+
+local function isInMatch(char, hrp)
+	if not char or not hrp then return false end
+	if hasBomb(char) then return true end
+	local parentName = string.lower(tostring(char.Parent and char.Parent.Name or ""))
+	if string.find(parentName, "lobby") or string.find(parentName, "waiting") or string.find(parentName, "spectat") then
+		return false
+	end
+	local floorPart = getFloorPart(char, hrp)
+	if not floorPart then return false end
+	local hitName = string.lower(floorPart.Name)
+	local hitAncestor = string.lower(tostring(floorPart.Parent and floorPart.Parent.Name or ""))
+	if string.find(hitName, "lobby") or string.find(hitAncestor, "lobby") then
+		return false
+	end
+	return true
+end
+
+local function isInSameArena(myChar, myHrp, targetChar, targetHrp)
+	if not myHrp or not targetHrp then return false end
+	if math.abs(targetHrp.Position.Y - myHrp.Position.Y) > 16 then return false end
+	local myFloor = getFloorPart(myChar, myHrp)
+	local targetFloor = getFloorPart(targetChar, targetHrp)
+	if not myFloor or not targetFloor then return false end
+	if myFloor ~= targetFloor then
+		local sameParent = myFloor.Parent and (myFloor.Parent == targetFloor.Parent)
+		local closeEnough = (myFloor.Position - targetFloor.Position).Magnitude < 18
+		if not (sameParent and closeEnough) then return false end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar, targetChar}
+	local delta = targetHrp.Position - myHrp.Position
+	local dist = Vector3.new(delta.X, 0, delta.Z).Magnitude
+	if dist < 1 then return true end
+	local steps = math.clamp(math.floor(dist / 6), 1, 8)
+	for i = 1, steps do
+		local samplePos = myHrp.Position + delta * (i / (steps + 1)) + Vector3.new(0, 2, 0)
+		if not workspace:Raycast(samplePos, Vector3.new(0, -18, 0), params) then
+			return false
+		end
+	end
+	return true
+end
+
+-- =========================================================
+-- 2) مظهر محلي مؤقت عند التفعيل فقط
+-- =========================================================
+local savedOutfit = { Shirt = nil, Pants = nil, DisplayName = nil, Colors = {}, Saved = false }
+
+local function applyCustomLocalStyle(char)
+	if not char then return end
+	if not savedOutfit.Saved then
+		savedOutfit.Colors = {}
+		local shirt = char:FindFirstChildOfClass("Shirt")
+		local pants = char:FindFirstChildOfClass("Pants")
+		savedOutfit.Shirt = shirt and shirt.ShirtTemplate or ""
+		savedOutfit.Pants = pants and pants.PantsTemplate or ""
+		local hum = char:FindFirstChildWhichIsA("Humanoid")
+		if hum then savedOutfit.DisplayName = hum.DisplayName end
+		for _, p in ipairs(char:GetChildren()) do
+			if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+				savedOutfit.Colors[p] = p.Color
+			end
+		end
+		savedOutfit.Saved = true
+	end
+	pcall(function()
+		local shirt = char:FindFirstChildOfClass("Shirt") or Instance.new("Shirt", char)
+		shirt.Name = "LocalShirtStyle"
+		shirt.ShirtTemplate = "rbxassetid://0"
+		local pants = char:FindFirstChildOfClass("Pants") or Instance.new("Pants", char)
+		pants.Name = "LocalPantsStyle"
+		pants.PantsTemplate = "rbxassetid://0"
+		for _, p in ipairs(char:GetChildren()) do
+			if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+				local ln = string.lower(p.Name)
+				if string.find(ln, "head") then
+					p.Color = Color3.fromRGB(240, 198, 168)
+				elseif string.find(ln, "torso") or string.find(ln, "upper") or string.find(ln, "lower") then
+					p.Color = Color3.fromRGB(24, 24, 34)
+				else
+					p.Color = Color3.fromRGB(220, 45, 70)
+				end
+			end
+		end
+		local hum = char:FindFirstChildWhichIsA("Humanoid")
+		if hum then hum.DisplayName = "Player_071" end
+	end)
+end
+
+local function restoreCustomLocalStyle(char)
+	if not savedOutfit.Saved then return end
+	pcall(function()
+		if char then
+			local shirt = char:FindFirstChildOfClass("Shirt")
+			if shirt then
+				if savedOutfit.Shirt == "" and shirt.Name == "LocalShirtStyle" then shirt:Destroy()
+				elseif savedOutfit.Shirt then shirt.ShirtTemplate = savedOutfit.Shirt end
+			end
+			local pants = char:FindFirstChildOfClass("Pants")
+			if pants then
+				if savedOutfit.Pants == "" and pants.Name == "LocalPantsStyle" then pants:Destroy()
+				elseif savedOutfit.Pants then pants.PantsTemplate = savedOutfit.Pants end
+			end
+			for p, col in pairs(savedOutfit.Colors) do
+				if p and p.Parent then p.Color = col end
+			end
+			local hum = char:FindFirstChildWhichIsA("Humanoid")
+			if hum and savedOutfit.DisplayName then hum.DisplayName = savedOutfit.DisplayName end
+		end
+	end)
+	savedOutfit.Colors = {}
+	savedOutfit.Saved = false
+end
+
+-- =========================================================
+-- 3) الذكاء الاصطناعي والمراوغة وتقدير المخاطر والزوايا
+-- =========================================================
+local rowRefs = {}
+local jukePhase = "none"
+local jukeTimer = 0
+local jukeSign = 1
+local arcPhaseClock = 0
+local currentMoveDir = Vector3.new(1, 0, 0)
+local lockedMoveDir = nil
+local jumpCooldown = 0
+local stuckTimer = 0
+local lastPos = nil
+local humanReactionDelay = 0
+local humanHesitateTimer = 0
+local currentTurnRate = 12.0
+local currentTargetPlr = nil
+local targetLockTimer = 0
+local pathComputeTimer = 0
+local cachedWaypoints = {}
+local waypointIndex = 2
+
+local function smoothHumanDir(fromDir, toDir, dt, turnSpeed)
+	if not toDir or toDir.Magnitude < 0.05 then return fromDir end
+	local targetUnit = Vector3.new(toDir.X, 0, toDir.Z).Unit
+	if not fromDir or fromDir.Magnitude < 0.05 then return targetUnit end
+	local fromUnit = Vector3.new(fromDir.X, 0, fromDir.Z).Unit
+	local alpha = math.clamp(dt * (turnSpeed or currentTurnRate or 12.0), 0.12, 0.72)
+	local blended = fromUnit:Lerp(targetUnit, alpha)
+	return blended.Magnitude < 0.01 and targetUnit or blended.Unit
+end
+
+local function steerCameraSoftly(myHrp, focusWorldPos, dt)
+	if not Config.AILock or not myHrp or not focusWorldPos then return end
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	pcall(function()
+		local flatLook = Vector3.new(focusWorldPos.X - myHrp.Position.X, 0, focusWorldPos.Z - myHrp.Position.Z)
+		if flatLook.Magnitude > 0.6 then
+			local aimPos = myHrp.Position + Vector3.new(0, 2.2, 0) + flatLook.Unit * 10
+			local desiredCF = CFrame.lookAt(cam.CFrame.Position, aimPos)
+			cam.CFrame = cam.CFrame:Lerp(desiredCF, math.clamp(dt * 8.0, 0.05, 0.35))
+		end
+	end)
+end
+
+local function applyAIMove(myHrp, myHum, desiredDir, targetPos, camFocusPos, dt)
+	if humanHesitateTimer > 0 then return end
+	local blendedDir = smoothHumanDir(currentMoveDir, desiredDir, dt or 0.05, currentTurnRate)
+	currentMoveDir = blendedDir
+	myHum:MoveTo(targetPos)
+	if camFocusPos then
+		steerCameraSoftly(myHrp, camFocusPos, dt or 0.05)
+	end
+end
+
+local function rotateFlatVector(vec, degrees)
+	local rad = math.rad(degrees)
+	local c, s = math.cos(rad), math.sin(rad)
+	return Vector3.new(vec.X * c - vec.Z * s, 0, vec.X * s + vec.Z * c).Unit
+end
+
+local function probeObstacle(myChar, myHrp, dir, dist)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar}
+	local lowHit = workspace:Raycast(myHrp.Position - Vector3.new(0, 1.3, 0), dir * dist, params)
+	local highHit = workspace:Raycast(myHrp.Position + Vector3.new(0, 2.2, 0), dir * dist, params)
+	if lowHit and (not lowHit.Instance.CanCollide or lowHit.Instance.Parent:FindFirstChildWhichIsA("Humanoid")) then lowHit = nil end
+	if highHit and (not highHit.Instance.CanCollide or highHit.Instance.Parent:FindFirstChildWhichIsA("Humanoid")) then highHit = nil end
+	if not lowHit and not highHit then
+		return "clear", math.huge
+	elseif lowHit and not highHit then
+		return "jumpable", lowHit.Distance
+	else
+		return "wall", math.min(lowHit and lowHit.Distance or dist, highHit and highHit.Distance or dist)
+	end
+end
+
+local function triggerJumpSkill(myHum, cooldownSec, dirToSnap)
+	if not myHum or jumpCooldown > 0 or myHum.FloorMaterial == Enum.Material.Air then return false end
+	if dirToSnap and dirToSnap.Magnitude > 0.05 then
+		currentMoveDir = Vector3.new(dirToSnap.X, 0, dirToSnap.Z).Unit
+	end
+	myHum.Jump = true
+	jumpCooldown = cooldownSec or (0.50 + math.random(5, 18) / 100)
+	return true
+end
+
+local function isSafeDirection(myChar, myHrp, myHum, dir)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar}
+	local myFloor = getFloorPart(myChar, myHrp)
+	local st, wallDist = probeObstacle(myChar, myHrp, dir, 8.5)
+	if st == "wall" and wallDist < 6.5 then return false end
+	for _, stepDist in ipairs({5, 9.5}) do
+		local floorHit = workspace:Raycast(myHrp.Position + dir * stepDist + Vector3.new(0, 2, 0), Vector3.new(0, -18, 0), params)
+		if not floorHit then
+			local farFloor = workspace:Raycast(myHrp.Position + dir * (stepDist + 4.5) + Vector3.new(0, 3, 0), Vector3.new(0, -20, 0), params)
+			if farFloor and myHum then
+				triggerJumpSkill(myHum, 0.52, dir)
+				return true
+			end
+			return false
+		end
+		if myFloor and floorHit.Instance ~= myFloor and floorHit.Instance.Parent ~= myFloor.Parent then
+			if math.abs(floorHit.Position.Y - myHrp.Position.Y) > 9 then return false end
+		end
+	end
+	return true
+end
+
+local function sanitizeDirection(myChar, myHrp, myHum, desiredDir)
+	if isSafeDirection(myChar, myHrp, myHum, desiredDir) then
+		local st, d = probeObstacle(myChar, myHrp, desiredDir, 7.5)
+		if st == "jumpable" and d < 5.5 then triggerJumpSkill(myHum, 0.50, desiredDir) end
+		return desiredDir
+	end
+	for _, deg in ipairs({25, -25, 50, -50, 75, -75, 105, -105, 135, -135, 180}) do
+		local candidate = rotateFlatVector(desiredDir, deg)
+		if isSafeDirection(myChar, myHrp, myHum, candidate) then
+			local st, d = probeObstacle(myChar, myHrp, candidate, 7.5)
+			if st == "jumpable" and d < 5.5 then triggerJumpSkill(myHum, 0.50, candidate) end
+			return candidate
+		end
+	end
+	return rotateFlatVector(desiredDir, 90 * jukeSign)
+end
+
+local function measureOpenSpace(myChar, originPos, dir)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar}
+	local leftHit = workspace:Raycast(originPos, rotateFlatVector(dir, 55) * 12, params)
+	local rightHit = workspace:Raycast(originPos, rotateFlatVector(dir, -55) * 12, params)
+	local leftSpace = (leftHit and leftHit.Instance.CanCollide) and leftHit.Distance or 12
+	local rightSpace = (rightHit and rightHit.Instance.CanCollide) and rightHit.Distance or 12
+	return leftSpace + rightSpace
+end
+
+local function getCornerTrapPenalty(myChar, checkPos, dir)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar}
+	local blockedRays = 0
+	for _, ang in ipairs({-90, -45, 0, 45, 90}) do
+		local ray = workspace:Raycast(checkPos + Vector3.new(0, 1, 0), rotateFlatVector(dir, ang) * 7.5, params)
+		if ray and ray.Instance and ray.Instance.CanCollide and not ray.Instance.Parent:FindFirstChildWhichIsA("Humanoid") then
+			blockedRays += 1
+		end
+	end
+	if blockedRays >= 4 then return 75 elseif blockedRays == 3 then return 35 end
+	return 0
+end
+
+local function hasCoverBetween(myChar, fromPos, threatPos)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar}
+	local delta = threatPos - fromPos
+	if delta.Magnitude < 1 then return false end
+	local ray = workspace:Raycast(fromPos + Vector3.new(0, 0.5, 0), delta.Unit * delta.Magnitude, params)
+	return (ray and ray.Instance and ray.Instance.CanCollide and not ray.Instance.Parent:FindFirstChildWhichIsA("Humanoid")) or false
+end
+
+local function computeSmartPath(startPos, goalPos)
+	local path = PathfindingService:CreatePath({ AgentRadius = 2.2, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 4 })
+	local ok = pcall(function() path:ComputeAsync(startPos, goalPos) end)
+	if ok and path.Status == Enum.PathStatus.Success then return path:GetWaypoints() end
+	return nil
+end
+
+local function findAscentSpot(myChar, myHrp, targetHrp)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar, targetHrp.Parent}
+	local flatToTarget = Vector3.new(targetHrp.Position.X - myHrp.Position.X, 0, targetHrp.Position.Z - myHrp.Position.Z)
+	local baseDir = (flatToTarget.Magnitude > 0.05) and flatToTarget.Unit or Vector3.new(1, 0, 0)
+	local bestSpot, bestScore = nil, -math.huge
+	for angOffset = -90, 90, 30 do
+		local probeDir = rotateFlatVector(baseDir, angOffset)
+		for _, dist in ipairs({5, 9, 13}) do
+			local downHit = workspace:Raycast(myHrp.Position + probeDir * dist + Vector3.new(0, 9.5, 0), Vector3.new(0, -11, 0), params)
+			if downHit and downHit.Instance and downHit.Instance.CanCollide then
+				local stepY = downHit.Position.Y - myHrp.Position.Y
+				if stepY > 2.2 and stepY <= 11.5 then
+					local score = (12 - math.abs(stepY - 5)) * 4 - dist * 1.5
+					if score > bestScore then
+						bestScore = score
+						bestSpot = downHit.Position + Vector3.new(0, 2, 0)
+					end
+				end
+			end
+		end
+	end
+	return bestSpot
+end
+
+local function computeInterceptPoint(myHrp, myHum, targetHrp, urgentMode)
+	local tVel = targetHrp.AssemblyLinearVelocity
+	local flatVel = Vector3.new(tVel.X, 0, tVel.Z)
+	local delta = targetHrp.Position - myHrp.Position
+	local dist = Vector3.new(delta.X, 0, delta.Z).Magnitude
+	local mySpeed = (myHum and myHum.WalkSpeed > 4) and myHum.WalkSpeed or 16
+	local interceptTime = math.clamp(dist / math.max(mySpeed, 10), 0.06, urgentMode and 0.24 or 0.42)
+	return targetHrp.Position + flatVel * interceptTime, flatVel
+end
+
+local function collectThreatEntities(myChar, myHrp)
+	local candidates = {}
+	local bombCarriers = {}
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if not isTeammate(plr) then
+			local tChar, tHrp = getCharacterParts(plr)
+			if tChar and tHrp and isInMatch(tChar, tHrp) and isInSameArena(myChar, myHrp, tChar, tHrp) then
+				local carriesBomb = hasBomb(tChar)
+				local timerLeft = carriesBomb and getRemainingBombTime(tChar) or nil
+				local distToMe = (tHrp.Position - myHrp.Position).Magnitude
+				local entry = {
+					char = tChar,
+					hrp = tHrp,
+					hasBomb = carriesBomb,
+					bombTime = timerLeft,
+					distToMe = distToMe,
+					likelyPassTarget = false,
+					threatScore = 0
+				}
+				table.insert(candidates, entry)
+				if carriesBomb then table.insert(bombCarriers, entry) end
+			end
+		end
+	end
+
+	for _, c in ipairs(candidates) do
+		if not c.hasBomb then
+			for _, b in ipairs(bombCarriers) do
+				local bDelta = c.hrp.Position - b.hrp.Position
+				local bFlat = Vector3.new(bDelta.X, 0, bDelta.Z)
+				local bDist = bFlat.Magnitude
+				local bLook = b.hrp.CFrame.LookVector
+				local bVel = b.hrp.AssemblyLinearVelocity
+				local bFlatVel = Vector3.new(bVel.X, 0, bVel.Z)
+
+				local isCloseToBomb = bDist < 22
+				local isAimedAtByBomb = (bFlat.Magnitude > 0.2) and (bLook:Dot(bFlat.Unit) > 0.55 and bDist < 32)
+				local isBombMovingToward = (bFlat.Magnitude > 0.2) and (bFlatVel.Magnitude > 3 and bFlatVel.Unit:Dot(bFlat.Unit) > 0.55 and bDist < 28)
+
+				if isCloseToBomb or isAimedAtByBomb or isBombMovingToward then
+					c.likelyPassTarget = true
+					break
+				end
+			end
+		end
+	end
+
+	local primaryThreat = nil
+	local highestThreatScore = -math.huge
+
+	for _, c in ipairs(candidates) do
+		local toMe = (myHrp.Position - c.hrp.Position)
+		local flatToMe = Vector3.new(toMe.X, 0, toMe.Z)
+		local dist = math.max(c.distToMe, 0.5)
+		local vel = c.hrp.AssemblyLinearVelocity
+		local flatVel = Vector3.new(vel.X, 0, vel.Z)
+		local approachingMe = (flatToMe.Magnitude > 0.2) and ((c.hrp.CFrame.LookVector:Dot(flatToMe.Unit) > 0.35) or (flatVel.Magnitude > 3 and flatVel.Unit:Dot(flatToMe.Unit) > 0.45))
+
+		local score = 0
+		if c.hasBomb then
+			score += 145
+			if c.bombTime and c.bombTime <= 4.5 then score += (5.0 - c.bombTime) * 22 end
+		elseif c.likelyPassTarget then
+			score += 72
+		end
+		if c.distToMe <= Config.AIDodgeDist then score += (Config.AIDodgeDist - c.distToMe) * 3.5 end
+		if c.distToMe < 13 then score += (13 - c.distToMe) * 5.2 end
+		if approachingMe then score += 26 end
+		score -= dist * 0.45
+
+		c.threatScore = score
+		if score > highestThreatScore then
+			highestThreatScore = score
+			primaryThreat = c
+		end
+	end
+
+	return candidates, primaryThreat, bombCarriers
+end
+
+local function evaluateDirectionScore(myChar, myHrp, dir, threats)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {myChar}
+	local myFloor = getFloorPart(myChar, myHrp)
+	local score = 0
+	local st, wallDist = probeObstacle(myChar, myHrp, dir, 15)
+	if st == "wall" then score -= (15 - wallDist) * 8.0
+	elseif st == "jumpable" then score += 9
+	else score += 24 end
+
+	local nextPos = myHrp.Position + dir * 8
+	score += measureOpenSpace(myChar, nextPos, dir) * 1.55
+	score -= getCornerTrapPenalty(myChar, nextPos, dir)
+
+	local floorHit = workspace:Raycast(myHrp.Position + dir * 8 + Vector3.new(0, 2, 0), Vector3.new(0, -18, 0), params)
+	if not floorHit then
+		score -= 140
+	elseif myFloor and floorHit.Instance ~= myFloor and floorHit.Instance.Parent ~= myFloor.Parent then
+		score += (math.abs(floorHit.Position.Y - myHrp.Position.Y) > 9) and -160 or 8
+	else
+		score += 12
+	end
+
+	if threats then
+		for _, t in ipairs(threats) do
+			local tVel = t.hrp.AssemblyLinearVelocity
+			local urgentFactor = (t.hasBomb and t.bombTime and t.bombTime <= 4.0) and 0.55 or 0.42
+			local predictedPos = t.hrp.Position + Vector3.new(tVel.X, 0, tVel.Z) * urgentFactor
+			local distFromNext = (nextPos - predictedPos).Magnitude
+
+			if t.hasBomb then
+				local timerBoost = (t.bombTime and t.bombTime <= 4.0) and 1.35 or 1.0
+				score += distFromNext * 2.45 * timerBoost
+				if distFromNext < 14 then score -= (14 - distFromNext) * 7.0 * timerBoost end
+				if hasCoverBetween(myChar, nextPos, predictedPos) then score += 36 end
+			elseif t.likelyPassTarget then
+				score += distFromNext * 1.40
+				if distFromNext < 12 then score -= (12 - distFromNext) * 4.5 end
+			else
+				score += distFromNext * 1.0
+				if distFromNext < 10 then score -= (10 - distFromNext) * 3.8 end
+			end
+		end
+	end
+
+	return score
+end
+
+local function pickBestPassTarget(myChar, myHrp, urgentMode)
+	local bestPlr, bestHrp, bestScore = nil, nil, math.huge
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if not isTeammate(plr) then
+			local tChar, tHrp = getCharacterParts(plr)
+			if tChar and tHrp and isInMatch(tChar, tHrp) and not hasBomb(tChar) and isInSameArena(myChar, myHrp, tChar, tHrp) then
+				local delta = tHrp.Position - myHrp.Position
+				local speed = Vector3.new(tHrp.AssemblyLinearVelocity.X, 0, tHrp.AssemblyLinearVelocity.Z).Magnitude
+				local cost = urgentMode and (delta.Magnitude + math.abs(delta.Y) * 1.1 + speed * 0.12) or (delta.Magnitude + speed * 0.25 + math.abs(delta.Y) * 1.5)
+				if cost < bestScore then
+					bestScore, bestPlr, bestHrp = cost, plr, tHrp
+				end
+			end
+		end
+	end
+	return bestPlr, bestHrp
+end
+
+local function handleVerticalEnemy(myChar, myHrp, myHum, targetHrp, iHaveBomb, urgentMode, dt)
+	local heightAbove = targetHrp.Position.Y - myHrp.Position.Y
+	if heightAbove <= 3.2 then return false end
+	local toTarget = targetHrp.Position - myHrp.Position
+	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
+	local flatDist = flat.Magnitude
+	local directDir = (flatDist > 0.05) and flat.Unit or Vector3.new(1, 0, 0)
+	local preferDropBait = iHaveBomb and (urgentMode or heightAbove > 7.5 or flatDist < 7)
+	if not preferDropBait then
+		local ascentSpot = findAscentSpot(myChar, myHrp, targetHrp)
+		if ascentSpot then
+			local spotFlat = Vector3.new(ascentSpot.X - myHrp.Position.X, 0, ascentSpot.Z - myHrp.Position.Z)
+			local safeClimb = sanitizeDirection(myChar, myHrp, myHum, (spotFlat.Magnitude > 0.05) and spotFlat.Unit or directDir)
+			currentTurnRate = urgentMode and 16.5 or 13.5
+			applyAIMove(myHrp, myHum, safeClimb, ascentSpot, targetHrp.Position, dt)
+			triggerJumpSkill(myHum, 0.50, safeClimb)
+			return true
+		end
+		if pathComputeTimer <= 0 or #cachedWaypoints == 0 then
+			pathComputeTimer = 0.35
+			local wps = computeSmartPath(myHrp.Position, targetHrp.Position)
+			if wps and #wps >= 2 then cachedWaypoints, waypointIndex = wps, 2 end
+		end
+		if cachedWaypoints[waypointIndex] then
+			local wp = cachedWaypoints[waypointIndex]
+			local wpFlat = Vector3.new(wp.Position.X - myHrp.Position.X, 0, wp.Position.Z - myHrp.Position.Z)
+			if wpFlat.Magnitude < 3.5 then
+				waypointIndex += 1
+			else
+				local stepDir = sanitizeDirection(myChar, myHrp, myHum, wpFlat.Unit)
+				currentTurnRate = urgentMode and 16.5 or 13.5
+				applyAIMove(myHrp, myHum, stepDir, wp.Position, targetHrp.Position, dt)
+				if wp.Action == Enum.PathWaypointAction.Jump or wp.Position.Y > myHrp.Position.Y + 1.5 then
+					triggerJumpSkill(myHum, 0.50, stepDir)
+				end
+				return true
+			end
+		end
+		local safeDirect = sanitizeDirection(myChar, myHrp, myHum, directDir)
+		currentTurnRate = urgentMode and 16.5 or 13.5
+		applyAIMove(myHrp, myHum, safeDirect, myHrp.Position + safeDirect * 11, targetHrp.Position, dt)
+		if flatDist < 15 then triggerJumpSkill(myHum, 0.52, safeDirect) end
+		return true
+	else
+		local orbitDir = rotateFlatVector(directDir, (70 * jukeSign) + math.sin(arcPhaseClock * 6.4) * 38)
+		local baitPos = Vector3.new(targetHrp.Position.X, myHrp.Position.Y, targetHrp.Position.Z) + orbitDir * 5
+		local safeBaitDir = sanitizeDirection(myChar, myHrp, myHum, (baitPos - myHrp.Position).Unit)
+		currentTurnRate = 15.0
+		applyAIMove(myHrp, myHum, safeBaitDir, baitPos, nil, dt)
+		return true
+	end
+end
+
+local function chaseAndPassToTarget(myChar, myHrp, myHum, targetHrp, urgentMode, dt)
+	if handleVerticalEnemy(myChar, myHrp, myHum, targetHrp, true, urgentMode, dt) then return end
+	local cutOffPos, flatVel = computeInterceptPoint(myHrp, myHum, targetHrp, urgentMode)
+	local toTarget = targetHrp.Position - myHrp.Position
+	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
+	local distFlat = flat.Magnitude
+	local directDir = (distFlat > 0.05) and flat.Unit or Vector3.new(1, 0, 0)
+
+	local predDelta = cutOffPos - myHrp.Position
+	local predFlat = Vector3.new(predDelta.X, 0, predDelta.Z)
+	local aimDir = (predFlat.Magnitude > 0.05) and predFlat.Unit or directDir
+
+	local obstacleType = probeObstacle(myChar, myHrp, aimDir, math.min(distFlat, 16))
+	local chosenDir, moveTargetPos = aimDir, cutOffPos
+	if distFlat <= 7.5 then
+		chosenDir = sanitizeDirection(myChar, myHrp, myHum, directDir)
+		moveTargetPos = targetHrp.Position + flatVel * 0.05
+		currentTurnRate = urgentMode and 19.5 or 17.5
+	elseif not urgentMode and obstacleType == "wall" and distFlat > 8.5 then
+		if pathComputeTimer <= 0 or #cachedWaypoints == 0 then
+			pathComputeTimer = 0.35
+			local wps = computeSmartPath(myHrp.Position, targetHrp.Position)
+			if wps and #wps >= 2 then cachedWaypoints, waypointIndex = wps, 2 end
+		end
+		if cachedWaypoints[waypointIndex] then
+			local wp = cachedWaypoints[waypointIndex]
+			local wpFlat = Vector3.new(wp.Position.X - myHrp.Position.X, 0, wp.Position.Z - myHrp.Position.Z)
+			if wpFlat.Magnitude < 3.5 then
+				waypointIndex += 1
+			else
+				chosenDir = sanitizeDirection(myChar, myHrp, myHum, wpFlat.Unit)
+				moveTargetPos = wp.Position
+				if wp.Action == Enum.PathWaypointAction.Jump then triggerJumpSkill(myHum, 0.50, chosenDir) end
+			end
+		else
+			chosenDir = sanitizeDirection(myChar, myHrp, myHum, aimDir)
+		end
+		currentTurnRate = 14.0
+	else
+		if distFlat > 11 and distFlat < 24 and not urgentMode then
+			aimDir = rotateFlatVector(aimDir, math.sin(arcPhaseClock * 7.5) * 18 * math.clamp((distFlat - 11) / 13, 0, 1) * jukeSign)
+		end
+		chosenDir = sanitizeDirection(myChar, myHrp, myHum, aimDir)
+		currentTurnRate = urgentMode and 18.5 or 14.5
+	end
+	applyAIMove(myHrp, myHum, chosenDir, moveTargetPos, (urgentMode or distFlat < 14) and targetHrp.Position or nil, dt)
+	if toTarget.Y > 2.2 then triggerJumpSkill(myHum, 0.50, chosenDir) end
+end
+
+local function buildLegendaryJukeDir(awayDir, bestSafeDir)
+	local sideDir = Vector3.new(-awayDir.Z * jukeSign, 0, awayDir.X * jukeSign)
+	local smoothWave = math.sin(arcPhaseClock * 10.0) * 0.30
+	if jukePhase == "bait" then
+		return (sideDir * (0.88 + smoothWave) + bestSafeDir * 0.42 + awayDir * 0.12).Unit
+	elseif jukePhase == "snap" then
+		local oppositeSide = Vector3.new(-awayDir.Z * (-jukeSign), 0, awayDir.X * (-jukeSign))
+		return (oppositeSide * (0.98 - smoothWave) + awayDir * 0.62 + bestSafeDir * 0.28).Unit
+	elseif jukePhase == "orbit" then
+		return (rotateFlatVector(sideDir, 36 * math.sin(arcPhaseClock * 8.2) * jukeSign) * 0.86 + awayDir * 0.58 + bestSafeDir * 0.26).Unit
+	elseif jukePhase == "zig_snap" then
+		local zigPulse = (math.floor(arcPhaseClock * 8.5) % 2 == 0) and 1 or -1
+		return (rotateFlatVector(sideDir, 46 * zigPulse) * 0.92 + awayDir * 0.54 + bestSafeDir * 0.24).Unit
+	elseif jukePhase == "feint_hook" then
+		return (rotateFlatVector(awayDir, 56 * jukeSign) * 0.80 + bestSafeDir * 0.64).Unit
+	elseif jukePhase == "dash_flank" then
+		return (rotateFlatVector(awayDir, 68 * jukeSign + math.cos(arcPhaseClock * 9.0) * 18) * 0.85 + bestSafeDir * 0.50).Unit
+	elseif jukePhase == "backstep_feint" then
+		return (rotateFlatVector(awayDir, 115 * jukeSign + math.sin(arcPhaseClock * 8.0) * 15) * 0.86 + bestSafeDir * 0.58).Unit
+	else
+		return (bestSafeDir * 0.66 + awayDir * 0.38 + sideDir * (0.56 + smoothWave)).Unit
+	end
+end
+
+local function pickNextJukePattern(nearestDist, threatApproaching, urgentTimer)
+	local roll = math.random(1, 100)
+	local rateBoost = urgentTimer and 1.5 or 0
+	if nearestDist < 13 then
+		if threatApproaching and roll <= 28 then jukePhase, jukeTimer, currentTurnRate = "backstep_feint", math.random(20, 32) / 100, 16.5 + rateBoost
+		elseif roll <= 56 then jukePhase, jukeTimer, currentTurnRate = "snap", math.random(20, 32) / 100, 16.5 + rateBoost
+		elseif roll <= 82 then jukePhase, jukeTimer, currentTurnRate = "zig_snap", math.random(24, 36) / 100, 16.0 + rateBoost
+		else jukePhase, jukeTimer, currentTurnRate = "feint_hook", math.random(22, 34) / 100, 15.5 + rateBoost end
+	elseif nearestDist < 20 then
+		if jukePhase == "bait" then jukePhase, jukeTimer, currentTurnRate = "snap", math.random(22, 34) / 100, 16.0 + rateBoost
+		elseif roll <= 28 then jukePhase, jukeTimer, currentTurnRate = "bait", math.random(13, 21) / 100, 14.0 + rateBoost
+		elseif roll <= 58 then jukePhase, jukeTimer, currentTurnRate = "dash_flank", math.random(24, 38) / 100, 14.5 + rateBoost
+		elseif roll <= 82 then jukePhase, jukeTimer, currentTurnRate = "orbit", math.random(26, 40) / 100, 13.5 + rateBoost
+		else jukePhase, jukeTimer, currentTurnRate = "backstep_feint", math.random(20, 32) / 100, 15.0 + rateBoost end
+	else
+		if roll <= 45 then jukePhase, jukeTimer, currentTurnRate = "orbit", math.random(26, 42) / 100, 13.0 + rateBoost
+		elseif roll <= 75 then jukePhase, jukeTimer, currentTurnRate = "dash_flank", math.random(24, 38) / 100, 13.5 + rateBoost
+		else jukePhase, jukeTimer, currentTurnRate = "zig_snap", math.random(22, 34) / 100, 14.5 + rateBoost end
+	end
+end
+
+local function runSmartAI(myChar, myHrp, myHum, dt)
+	if not Config.AI or not isInMatch(myChar, myHrp) then return end
+	arcPhaseClock += dt
+	jukeTimer = math.max(0, jukeTimer - dt)
+	jumpCooldown = math.max(0, jumpCooldown - dt)
+	targetLockTimer = math.max(0, targetLockTimer - dt)
+	pathComputeTimer = math.max(0, pathComputeTimer - dt)
+	humanReactionDelay = math.max(0, humanReactionDelay - dt)
+	humanHesitateTimer = math.max(0, humanHesitateTimer - dt)
+
+	if lastPos then
+		if (myHrp.Position - lastPos).Magnitude < 0.08 and myHum.WalkSpeed > 2 then stuckTimer += dt else stuckTimer = 0 end
+	end
+	lastPos = myHrp.Position
+
+	if stuckTimer > 0.28 then
+		stuckTimer, jukeSign, jukePhase, jukeTimer, currentTurnRate, cachedWaypoints = 0, -jukeSign, "snap", 0.28, 17.0, {}
+		triggerJumpSkill(myHum, 0.50, rotateFlatVector(currentMoveDir, 52 * jukeSign))
+	end
+
+	if hasBomb(myChar) then
+		jukePhase = "none"
+		local myBombTime = getRemainingBombTime(myChar)
+		local urgentPass = (myBombTime ~= nil and myBombTime <= 4.0)
+		local lockedChar, lockedHrp = getCharacterParts(currentTargetPlr)
+		local needNewTarget = (not currentTargetPlr) or isTeammate(currentTargetPlr) or (not lockedChar) or (not lockedHrp) or (not isInMatch(lockedChar, lockedHrp)) or hasBomb(lockedChar) or (not isInSameArena(myChar, myHrp, lockedChar, lockedHrp)) or (targetLockTimer <= 0) or ((lockedHrp.Position - myHrp.Position).Magnitude > 60)
+		if urgentPass or needNewTarget then
+			currentTargetPlr, lockedHrp = pickBestPassTarget(myChar, myHrp, urgentPass)
+			targetLockTimer = urgentPass and 0.22 or 0.85
+			cachedWaypoints = {}
+		end
+		if lockedHrp then
+			chaseAndPassToTarget(myChar, myHrp, myHum, lockedHrp, urgentPass, dt)
+		else
+			local safeRoam = sanitizeDirection(myChar, myHrp, myHum, currentMoveDir)
+			applyAIMove(myHrp, myHum, safeRoam, myHrp.Position + safeRoam * 8, nil, dt)
+		end
+	else
+		currentTargetPlr, cachedWaypoints = nil, {}
+		local threats, primaryThreat = collectThreatEntities(myChar, myHrp)
+		local threatHrp = primaryThreat and primaryThreat.hrp or nil
+		local nearestDist = primaryThreat and primaryThreat.distToMe or math.huge
+		local bombTimeLeft = (primaryThreat and primaryThreat.hasBomb) and primaryThreat.bombTime or nil
+		local urgentTimer = (bombTimeLeft ~= nil and bombTimeLeft <= 3.5)
+
+		if threatHrp and (threatHrp.Position.Y - myHrp.Position.Y) > 3.5 and nearestDist <= Config.AIDodgeDist then
+			handleVerticalEnemy(myChar, myHrp, myHum, threatHrp, false, urgentTimer, dt)
+			return
+		end
+
+		local highDangerNow = primaryThreat and (
+			(primaryThreat.hasBomb and (urgentTimer or nearestDist < 12.0))
+			or (primaryThreat.likelyPassTarget and nearestDist < 10.5)
+			or (nearestDist < 8.5)
+		)
+
+		if highDangerNow then
+			local awayFlat = Vector3.new(myHrp.Position.X - threatHrp.Position.X, 0, myHrp.Position.Z - threatHrp.Position.Z)
+			local awayDir = (awayFlat.Magnitude > 0.05) and awayFlat.Unit or Vector3.new(1, 0, 0)
+			local quickFlip = (math.floor(arcPhaseClock * (urgentTimer and 11 or 9)) % 2 == 0) and 1 or -1
+			local safeEscape = sanitizeDirection(myChar, myHrp, myHum, rotateFlatVector(awayDir, (48 * jukeSign * quickFlip) + math.sin(arcPhaseClock * 10) * 20))
+			currentTurnRate = urgentTimer and 19.0 or 17.0
+			applyAIMove(myHrp, myHum, safeEscape, myHrp.Position + safeEscape * 13, myHrp.Position + safeEscape * 9, dt)
+			if nearestDist < 12 and math.random(1, 100) <= (urgentTimer and 80 or 68) then
+				triggerJumpSkill(myHum, 0.50, safeEscape)
+				jukeSign = -jukeSign
+			end
+			return
+		end
+
+		if Config.AILock and lockedMoveDir then
+			local safeLocked = sanitizeDirection(myChar, myHrp, myHum, lockedMoveDir)
+			currentTurnRate = 15.5
+			applyAIMove(myHrp, myHum, safeLocked, myHrp.Position + safeLocked * 12, myHrp.Position + safeLocked * 9, dt)
+			return
+		end
+
+		local bestDir, bestDirScore = currentMoveDir, -math.huge
+		for i = 0, 15 do
+			local ang = math.rad(i * 22.5)
+			local candidateDir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+			local s = evaluateDirectionScore(myChar, myHrp, candidateDir, threats)
+			if s > bestDirScore then bestDirScore, bestDir = s, candidateDir end
+		end
+
+		if threatHrp and nearestDist <= Config.AIDodgeDist then
+			local awayFlat = Vector3.new(myHrp.Position.X - threatHrp.Position.X, 0, myHrp.Position.Z - threatHrp.Position.Z)
+			local awayDir = (awayFlat.Magnitude > 0.05) and awayFlat.Unit or bestDir
+			local toMe = (myHrp.Position - threatHrp.Position).Unit
+			local tFlatVel = Vector3.new(threatHrp.AssemblyLinearVelocity.X, 0, threatHrp.AssemblyLinearVelocity.Z)
+			local approachingMe = (threatHrp.CFrame.LookVector:Dot(toMe) > 0.30) or (tFlatVel.Magnitude > 3 and tFlatVel.Unit:Dot(toMe) > 0.45)
+			if jukeTimer <= 0 and humanReactionDelay <= 0 then
+				humanReactionDelay = urgentTimer and (math.random(4, 10) / 100) or (math.random(6, 15) / 100)
+				if not urgentTimer and math.random(1, 100) <= 5 then humanHesitateTimer = math.random(4, 8) / 100 end
+				jukeSign = (math.random(1, 100) <= 72) and -jukeSign or ((math.random(1, 2) == 1) and 1 or -1)
+				pickNextJukePattern(nearestDist, approachingMe, urgentTimer)
+			end
+			local safeJuke = sanitizeDirection(myChar, myHrp, myHum, buildLegendaryJukeDir(awayDir, bestDir))
+			lockedMoveDir = safeJuke
+			applyAIMove(myHrp, myHum, safeJuke, myHrp.Position + safeJuke * 12, (nearestDist < 14 or urgentTimer) and (myHrp.Position + safeJuke * 9) or nil, dt)
+			if nearestDist < 13.5 and approachingMe and math.random(1, 100) <= 65 then
+				jukeSign, jukePhase, jukeTimer, currentTurnRate = -jukeSign, "snap", 0.25, 17.5
+				triggerJumpSkill(myHum, 0.50, rotateFlatVector(safeJuke, 40 * jukeSign))
+			end
+		else
+			jukePhase, currentTurnRate = "none", 11.5
+			if jukeTimer <= 0 then
+				jukeTimer = math.random(35, 60) / 100
+				if math.random(1, 100) <= 45 then jukeSign = -jukeSign end
+				local side = Vector3.new(-bestDir.Z * jukeSign, 0, bestDir.X * jukeSign)
+				local safeRoam = sanitizeDirection(myChar, myHrp, myHum, (bestDir * 0.84 + side * 0.32).Unit)
+				lockedMoveDir = safeRoam
+				applyAIMove(myHrp, myHum, safeRoam, myHrp.Position + safeRoam * 9, nil, dt)
+			else
+				local safeCurr = sanitizeDirection(myChar, myHrp, myHum, currentMoveDir)
+				lockedMoveDir = safeCurr
+				applyAIMove(myHrp, myHum, safeCurr, myHrp.Position + safeCurr * 9, nil, dt)
+			end
+		end
+	end
+end
+
+-- =========================================================
+-- 4) واجهة التحكم
+-- =========================================================
+local function buildUI()
+	local oldGui = playerGui:FindFirstChild("MatchPanelUI")
+	if oldGui then oldGui:Destroy() end
+
+	local ScreenGui = Instance.new("ScreenGui")
+	ScreenGui.Name = "MatchPanelUI"
+	ScreenGui.ResetOnSpawn = false
+	ScreenGui.IgnoreGuiInset = true
+	ScreenGui.DisplayOrder = 5000
+	ScreenGui.Parent = playerGui
+
+	local HEADER_HEIGHT = 44
+	local ROW_HEIGHT = 42
+	local ROW_GAP = 6
+	local FULL_HEIGHT = HEADER_HEIGHT + 12 + (4 * ROW_HEIGHT) + (3 * ROW_GAP)
+
+	local MainFrame = Instance.new("Frame")
+	MainFrame.Size = UDim2.new(0, 280, 0, FULL_HEIGHT)
+	MainFrame.Position = UDim2.new(0.24, 0, 0.18, 0)
+	MainFrame.BackgroundColor3 = Color3.fromRGB(16, 17, 24)
+	MainFrame.BorderSizePixel = 0
+	MainFrame.Active = true
+	MainFrame.Draggable = true
+	MainFrame.Parent = ScreenGui
+	Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 14)
+
+	local MainStroke = Instance.new("UIStroke")
+	MainStroke.Thickness = 1.6
+	MainStroke.Color = Color3.fromRGB(95, 110, 255)
+	MainStroke.Parent = MainFrame
+
+	local Header = Instance.new("Frame")
+	Header.Size = UDim2.new(1, 0, 0, HEADER_HEIGHT)
+	Header.BackgroundColor3 = Color3.fromRGB(28, 30, 44)
+	Header.BorderSizePixel = 0
+	Header.Parent = MainFrame
+	Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 14)
+
+	local TitleLabel = Instance.new("TextLabel")
+	TitleLabel.Size = UDim2.new(1, -84, 0, 18)
+	TitleLabel.Position = UDim2.new(0, 12, 0, 5)
+	TitleLabel.BackgroundTransparency = 1
+	TitleLabel.Text = "MATCH | SMART CONTROL"
+	TitleLabel.TextColor3 = Color3.fromRGB(245, 247, 255)
+	TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+	TitleLabel.Font = Enum.Font.GothamBlack
+	TitleLabel.TextSize = 13
+	TitleLabel.Parent = Header
+
+	local SubLabel = Instance.new("TextLabel")
+	SubLabel.Size = UDim2.new(1, -84, 0, 14)
+	SubLabel.Position = UDim2.new(0, 12, 0, 24)
+	SubLabel.BackgroundTransparency = 1
+	SubLabel.Text = "Arena • Evade • Pass • Style"
+	SubLabel.TextColor3 = Color3.fromRGB(135, 145, 185)
+	SubLabel.TextXAlignment = Enum.TextXAlignment.Left
+	SubLabel.Font = Enum.Font.GothamMedium
+	SubLabel.TextSize = 9
+	SubLabel.Parent = Header
+
+	local MinBtn = Instance.new("TextButton")
+	MinBtn.Size = UDim2.new(0, 28, 0, 28)
+	MinBtn.Position = UDim2.new(1, -66, 0, 8)
+	MinBtn.BackgroundColor3 = Color3.fromRGB(48, 52, 74)
+	MinBtn.Text = "-"
+	MinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	MinBtn.Font = Enum.Font.GothamBold
+	MinBtn.TextSize = 16
+	MinBtn.Parent = Header
+	Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 8)
+
+	local CloseBtn = Instance.new("TextButton")
+	CloseBtn.Size = UDim2.new(0, 28, 0, 28)
+	CloseBtn.Position = UDim2.new(1, -34, 0, 8)
+	CloseBtn.BackgroundColor3 = Color3.fromRGB(210, 52, 70)
+	CloseBtn.Text = "X"
+	CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	CloseBtn.Font = Enum.Font.GothamBold
+	CloseBtn.TextSize = 13
+	CloseBtn.Parent = Header
+	Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
+
+	local Body = Instance.new("Frame")
+	Body.Size = UDim2.new(1, -16, 0, FULL_HEIGHT - HEADER_HEIGHT - 12)
+	Body.Position = UDim2.new(0, 8, 0, HEADER_HEIGHT + 6)
+	Body.BackgroundTransparency = 1
+	Body.Parent = MainFrame
+
+	local ListLayout = Instance.new("UIListLayout")
+	ListLayout.Padding = UDim.new(0, ROW_GAP)
+	ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	ListLayout.Parent = Body
+
+	local function createFeatureRow(keyName, order, title, valueConfig, onToggle)
+		local row = Instance.new("Frame")
+		row.Name = keyName .. "Row"
+		row.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
+		row.BackgroundColor3 = Color3.fromRGB(27, 29, 41)
+		row.BorderSizePixel = 0
+		row.LayoutOrder = order
+		row.Parent = Body
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+
+		local hasStepper = valueConfig ~= nil
+		local toggleWidth = hasStepper and 130 or 248
+
+		local toggleBtn = Instance.new("TextButton")
+		toggleBtn.Size = UDim2.new(0, toggleWidth, 1, -8)
+		toggleBtn.Position = UDim2.new(0, 4, 0, 4)
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 43, 60)
+		toggleBtn.Text = title .. " : OFF"
+		toggleBtn.TextColor3 = Color3.fromRGB(250, 250, 255)
+		toggleBtn.Font = Enum.Font.GothamBold
+		toggleBtn.TextSize = 11
+		toggleBtn.Parent = row
+		Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
+
+		local state = false
+		local function setState(newState)
+			state = newState
+			toggleBtn.Text = title .. (state and " : ON" or " : OFF")
+			toggleBtn.BackgroundColor3 = state and Color3.fromRGB(28, 155, 95) or Color3.fromRGB(40, 43, 60)
+			onToggle(state)
+		end
+
+		toggleBtn.MouseButton1Click:Connect(function() setState(not state) end)
+		rowRefs[keyName] = { button = toggleBtn, setState = setState }
+
+		if hasStepper then
+			local minusBtn = Instance.new("TextButton")
+			minusBtn.Size = UDim2.new(0, 28, 1, -8)
+			minusBtn.Position = UDim2.new(0, 138, 0, 4)
+			minusBtn.BackgroundColor3 = Color3.fromRGB(58, 62, 86)
+			minusBtn.Text = "-"
+			minusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+			minusBtn.Font = Enum.Font.GothamBlack
+			minusBtn.TextSize = 15
+			minusBtn.Parent = row
+			Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 8)
+
+			local valLabel = Instance.new("TextLabel")
+			valLabel.Size = UDim2.new(0, 52, 1, -8)
+			valLabel.Position = UDim2.new(0, 168, 0, 4)
+			valLabel.BackgroundColor3 = Color3.fromRGB(19, 21, 30)
+			valLabel.Text = tostring(Config[valueConfig.key])
+			valLabel.TextColor3 = Color3.fromRGB(130, 220, 255)
+			valLabel.Font = Enum.Font.GothamBold
+			valLabel.TextSize = 11
+			valLabel.Parent = row
+			Instance.new("UICorner", valLabel).CornerRadius = UDim.new(0, 8)
+
+			local plusBtn = Instance.new("TextButton")
+			plusBtn.Size = UDim2.new(0, 28, 1, -8)
+			plusBtn.Position = UDim2.new(0, 222, 0, 4)
+			plusBtn.BackgroundColor3 = Color3.fromRGB(78, 92, 235)
+			plusBtn.Text = "+"
+			plusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+			plusBtn.Font = Enum.Font.GothamBlack
+			plusBtn.TextSize = 15
+			plusBtn.Parent = row
+			Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 8)
+
+			local function stepVal(delta)
+				local v = math.clamp(Config[valueConfig.key] + delta, valueConfig.min, valueConfig.max)
+				Config[valueConfig.key] = v
+				valLabel.Text = tostring(v)
+			end
+
+			minusBtn.MouseButton1Click:Connect(function() stepVal(-valueConfig.step) end)
+			plusBtn.MouseButton1Click:Connect(function() stepVal(valueConfig.step) end)
+		end
+	end
+
+	createFeatureRow("reach", 1, "Bomb Reach", { key = "ReachSize", min = 4, max = 20, step = 1 }, function(s)
+		Config.Reach = s
+	end)
+
+	createFeatureRow("ai", 2, "Smart AI", { key = "AIDodgeDist", min = 12, max = 60, step = 4 }, function(s)
+		Config.AI = s
+		cachedWaypoints, jukePhase = {}, "none"
+		if not s then
+			if rowRefs.lock then rowRefs.lock.setState(false) end
+			local myChar, _, myHum = getCharacterParts(LocalPlayer)
+			if myChar and myHum then myHum:MoveTo(myChar:GetPivot().Position) end
+		end
+	end)
+
+	createFeatureRow("lock", 3, "Lock AI", nil, function(s)
+		if s and not Config.AI then
+			Config.AILock, lockedMoveDir = false, nil
+			task.defer(function()
+				if rowRefs.lock and rowRefs.lock.setState then rowRefs.lock.setState(false) end
+			end)
+			return
+		end
+		Config.AILock = s
+		lockedMoveDir = s and currentMoveDir or nil
+	end)
+
+	createFeatureRow("ff071", 4, "FF_071", nil, function(s)
+		Config.FF_071 = s
+		if s then applyCustomLocalStyle(LocalPlayer.Character) else restoreCustomLocalStyle(LocalPlayer.Character) end
+	end)
+
+	local minimized = false
+	MinBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		Body.Visible = not minimized
+		MinBtn.Text = minimized and "+" or "-"
+		MainFrame.Size = minimized and UDim2.new(0, 280, 0, HEADER_HEIGHT) or UDim2.new(0, 280, 0, FULL_HEIGHT)
+	end)
+
+	CloseBtn.MouseButton1Click:Connect(function()
+		Config.Reach, Config.AI, Config.AILock, Config.FF_071 = false, false, false, false
+		restoreCustomLocalStyle(LocalPlayer.Character)
+		ScreenGui:Destroy()
+	end)
+end
+
+pcall(buildUI)
+
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+	savedOutfit.Saved = false
+	if Config.FF_071 then
+		task.wait(0.25)
+		applyCustomLocalStyle(newChar)
+	end
+end)
+
+local stepAccum = 0
+RunService.RenderStepped:Connect(function(dt)
+	stepAccum += dt
+	if stepAccum < 0.08 then return end
+	local elapsed = stepAccum
+	stepAccum = 0
+
+	local myChar, myHrp, myHum = getCharacterParts(LocalPlayer)
+	if not myChar or not myHrp or not myHum then return end
+	if Config.FF_071 then applyCustomLocalStyle(myChar) end
+	if Config.AI then
+		pcall(runSmartAI, myChar, myHrp, myHum, elapsed)
+	end
+end)
